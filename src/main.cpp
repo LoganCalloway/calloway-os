@@ -48,11 +48,13 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
+#include "secrets.h"
+
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
 #define OS_VERSION    "CALLOWAY_OS v1.6"
-const char* weatherKey  = "ba635bfab9190ef5a8f86cab9aaf1d0d";
+const char* weatherKey = WEATHER_API_KEY;
 String currentCity      = "Asheville,US";   // gets updated by syncLocationAndTime()
 long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTime()
 
