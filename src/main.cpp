@@ -10,7 +10,7 @@
 //  Product      : Omni-Core Telemetry Station
 //  Platform     : XIAO ESP32-C6
 //  Display      : ILI9341 2.8" TFT (320x240)
-//  Version      : v1.6
+//  Version      : v1.7
 //  Author       : Logan Calloway
 //  License      : Copyright (c) 2025 Logan Calloway. All Rights Reserved.
 //                 Unauthorized copying, distribution, or modification of
@@ -19,11 +19,11 @@
 //  Description  :
 //    A desktop engineering dashboard built on the XIAO ESP32-C6. Pulls time
 //    from NTP, weather from OpenWeatherMap, and reads live environmental data
-//    from the TSL2591 (light) and BME280 (temp, humidity, pressure). Has a
-//    scrollable settings menu navigated by a single hardware button. All
-//    settings persist across reboots via NVS. Auto Dim drives the backlight
-//    from the TSL2591 lux reading once the PFET is wired up.
-//    Air quality (SGP30) will be added when a genuine sensor arrives.
+//    from the TSL2591 (light), SCD40 (CO2, temp, humidity), and SGP41
+//    (VOC index, NOx index). Has a scrollable settings menu navigated by a
+//    single hardware button. All settings persist across reboots via NVS.
+//    Auto Dim drives the backlight from the TSL2591 lux reading once the
+//    PFET is wired up.
 // -----------------------------------------------------------------------------
 //  How it's organized :
 //    DATA LAYER    — functions that fetch or calculate data, never draw
@@ -38,8 +38,11 @@
 #include <ArduinoJson.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
-#include <Adafruit_BME280.h>
 #include <Adafruit_TSL2591.h>
+#include <SensirionI2cScd4x.h>
+#include <SensirionI2CSgp41.h>
+#include <VOCGasIndexAlgorithm.h>
+#include <NOxGasIndexAlgorithm.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
@@ -53,8 +56,8 @@
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
-#define OS_VERSION    "CALLOWAY_OS v1.6"
-const char* weatherKey = WEATHER_API_KEY;
+#define OS_VERSION    "CALLOWAY_OS v1.7"
+const char* weatherKey  = WEATHER_API_KEY;
 String currentCity      = "Asheville,US";   // gets updated by syncLocationAndTime()
 long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTime()
 
@@ -92,11 +95,18 @@ long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTi
 #define LUX_BAR_HEIGHT  60
 #define LUX_MAX        400  // tweak to match your room — 400 works well indoors
 
-// Local sensor readings (top left)
+// Local sensor readings — top left (SCD40 temp and humidity)
 #define LOCAL_X        5
 #define LOCAL_TEMP_Y   20
 #define LOCAL_HUM_Y    35
-#define LOCAL_PRES_Y   50
+
+// Air quality readings — bottom of screen
+#define AQ_CO2_X       30   // CO2 bottom left
+#define AQ_CO2_Y      220
+#define AQ_VOC_X      130   // VOC index bottom middle
+#define AQ_VOC_Y      220
+#define AQ_NOX_X      220   // NOx index bottom right
+#define AQ_NOX_Y      220
 
 // =============================================================================
 // BRIGHTNESS CONSTANTS
@@ -118,7 +128,7 @@ const int FORECAST_PERIODS_24H = 8; // 8 x 3hr intervals = 24hr lookahead
 // =============================================================================
 const long clockInterval    =    100;   // 0.1s  — clock redraw
 const long wifiIconInterval =   5000;   // 5s    — WiFi icon redraw
-const long sensorInterval   =   2000;   // 2s    — local sensors
+const long sensorInterval   =   1000;   // 1s    — check sensors, SCD40 controls its own timing
 const long weatherInterval  = 900000;   // 15min — weather fetch
 const long ntpInterval      = 3600000;  // 1h    — NTP resync
 
@@ -131,13 +141,17 @@ unsigned long lastNtpTime      = 0;
 // =============================================================================
 // OBJECTS
 // =============================================================================
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
-Adafruit_BME280  bme;
-Adafruit_TSL2591 tsl = Adafruit_TSL2591(2591);
-Preferences      prefs;
-GFXcanvas16      clockCanvas(260, 45); // clock buffer — prevents flicker on second updates
-GFXcanvas16      localCanvas(150, 55); // local sensor buffer — prevents flicker on 2s updates
-GFXcanvas16      dateCanvas(240, 20);  // date buffer — prevents flicker on minute updates
+Adafruit_ILI9341     tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_TSL2591     tsl = Adafruit_TSL2591(2591);
+SensirionI2cScd4x    scd4x;
+SensirionI2CSgp41    sgp41;
+VOCGasIndexAlgorithm vocAlgorithm;
+NOxGasIndexAlgorithm noxAlgorithm;
+Preferences          prefs;
+GFXcanvas16          clockCanvas(260, 45); // clock buffer — prevents flicker on second updates
+GFXcanvas16          localCanvas(150, 40); // local sensor buffer — temp and humidity
+GFXcanvas16          aqCanvas(290, 20);    // air quality buffer — CO2, VOC, NOx
+GFXcanvas16          dateCanvas(240, 20);  // date buffer — prevents flicker on minute updates
 
 // =============================================================================
 // STATE
@@ -145,7 +159,8 @@ GFXcanvas16      dateCanvas(240, 20);  // date buffer — prevents flicker on mi
 int  lastMin = -1, lastSec = -1;  // only redraw when something actually changed
 bool isNightMode          = false;
 bool hasWeatherData       = false; // don't draw weather until we have real data
-bool hasBMEData           = false; // don't draw local sensors until first read
+bool hasSCD40Data         = false; // don't draw local sensors until first read
+bool hasSGP41Data         = false; // don't draw air quality until warmup completes
 bool isCelsius            = false; // temp unit — false = Fahrenheit
 bool isMilitaryTime       = false; // 24hr clock toggle
 bool isAutoDim            = false; // auto dim from TSL2591 — activates when PFET is wired
@@ -163,10 +178,12 @@ float  g_tempLow     = 0;
 String g_skyStatus   = "";
 
 // Sensor globals — updateLocalSensors() writes these, updateSensorDisplay() reads them
-float g_lux       = 0;
-float g_localTemp = 0;
-float g_humidity  = 0;
-float g_pressure  = 0;
+float    g_lux       = 0;
+float    g_localTemp = 0; // SCD40 temp, stored as Fahrenheit
+float    g_humidity  = 0; // SCD40 humidity
+uint16_t g_co2       = 0; // SCD40 CO2 in ppm
+int32_t  g_voc       = 0; // SGP41 VOC index 0-500
+int32_t  g_nox       = 0; // SGP41 NOx index 0-500
 
 // =============================================================================
 // COLOR PALETTE — one place for all colors, works for both day and night mode
@@ -184,20 +201,33 @@ struct ColorPalette {
   uint16_t luxBg;        // light bar background
   uint16_t wifiActive;   // WiFi icon when connected
   uint16_t wifiInactive; // WiFi icon when disconnected
+  uint16_t co2Good;      // CO2 color when levels are normal
+  uint16_t co2Warn;      // CO2 color when levels are elevated
+  uint16_t co2High;      // CO2 color when levels are high
 };
 
 ColorPalette getColorPalette() {
   if (isNightMode) {
     return { 0xF800, 0x8000, 0xA000, 0x4000, 0x8000, 0xFBE0, 0xF800, 0x0410,
-             0x8000, 0x2104, 0x0400, 0x4000 };
+             0x8000, 0x2104, 0x0400, 0x4000,
+             0x4000, 0x8400, 0x8000 };
   } else {
     return {
       ILI9341_WHITE, ILI9341_LIGHTGREY, ILI9341_YELLOW,
       ILI9341_DARKGREY, ILI9341_LIGHTGREY, ILI9341_ORANGE,
       ILI9341_RED, ILI9341_CYAN,
-      ILI9341_YELLOW, 0x2104, ILI9341_GREEN, ILI9341_RED
+      ILI9341_YELLOW, 0x2104, ILI9341_GREEN, ILI9341_RED,
+      ILI9341_GREEN, ILI9341_YELLOW, ILI9341_RED
     };
   }
+}
+
+// Returns the right CO2 color based on the current reading
+// Good: <800ppm  Warn: 800-1200ppm  High: >1200ppm
+uint16_t getCO2Color(ColorPalette col) {
+  if (g_co2 < 800)  return col.co2Good;
+  if (g_co2 < 1200) return col.co2Warn;
+  return col.co2High;
 }
 
 // =============================================================================
@@ -265,14 +295,39 @@ void setup() {
 
   showSplashScreen();
 
-  // I2C bus — shared by TSL2591 and BME280
+  // I2C bus — shared by TSL2591, SCD40, and SGP41
   Wire.begin(TFT_SDA, TFT_SCL);
 
+  // TSL2591 light sensor
   tsl.begin();
   tsl.setGain(TSL2591_GAIN_LOW);
   tsl.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+  Serial.println("[TSL2591] Started");
 
-  if (!bme.begin(0x76, &Wire)) Serial.println("[BME] Init failed");
+  // Reset I2C bus after TSL2591 — TSL2591 leaves bus busy which blocks SCD40
+  Wire.end();
+  delay(50);
+  Wire.begin(TFT_SDA, TFT_SCL);
+
+  // SCD40 CO2, temperature, and humidity sensor
+  // stop any previous measurement before starting fresh
+  scd4x.begin(Wire, SCD40_I2C_ADDR_62);
+  scd4x.stopPeriodicMeasurement();
+  delay(200);
+  uint16_t scd40Error = scd4x.startPeriodicMeasurement();
+  if (scd40Error) {
+    Serial.println("[SCD40] Init failed");
+  } else {
+    Serial.println("[SCD40] Started");
+  }
+
+  // SGP41 VOC and NOx sensor — conditioning run before first measurement
+  sgp41.begin(Wire);
+  uint16_t defaultRh      = 0x8000; // 50% RH default during conditioning
+  uint16_t defaultT       = 0x6666; // 25C default during conditioning
+  uint16_t conditioning_s = 0;
+  sgp41.executeConditioning(defaultRh, defaultT, conditioning_s);
+  Serial.println("[SGP41] Started");
 
   handleDeepReset();
   manageWiFiVault();     // blocks here until connected — watchdog not armed yet
@@ -423,7 +478,7 @@ void updateWeatherDisplay() {
   tft.printf("L:%.0f", displayLow);
 }
 
-// Draws lux bar and BME280 local readings — waits for real data before drawing
+// Draws lux bar, SCD40 local readings, and SGP41 air quality
 void updateSensorDisplay() {
   ColorPalette col = getColorPalette();
 
@@ -432,27 +487,49 @@ void updateSensorDisplay() {
   tft.fillRect(LUX_BAR_X, LUX_BAR_Y, LUX_BAR_WIDTH, LUX_BAR_HEIGHT, col.luxBg);
   tft.fillRect(LUX_BAR_X, LUX_BAR_Y + (LUX_BAR_HEIGHT - fillHeight), LUX_BAR_WIDTH, fillHeight, col.luxBar);
 
-  // BME280 — top left, draws as soon as first read succeeds
-  if (!hasBMEData) return;
+  // SCD40 — top left, temp and humidity, draws as soon as first read succeeds
+  if (hasSCD40Data) {
+    float displayLocalTemp = isCelsius ? (g_localTemp - 32) * 5.0 / 9.0 : g_localTemp;
+    const char* unit = isCelsius ? "C" : "F";
 
-  float displayLocalTemp = isCelsius ? (g_localTemp - 32) * 5.0 / 9.0 : g_localTemp;
-  const char* unit = isCelsius ? "C" : "F";
+    localCanvas.fillScreen(ILI9341_BLACK);
+    localCanvas.setFont(&FreeMono9pt7b);
 
-  localCanvas.fillScreen(ILI9341_BLACK);
-  localCanvas.setFont(&FreeMono9pt7b);
+    localCanvas.setTextColor(col.temp);
+    localCanvas.setCursor(LOCAL_X, LOCAL_TEMP_Y);
+    localCanvas.printf("%.1f%s", displayLocalTemp, unit);
 
-  localCanvas.setTextColor(col.temp);
-  localCanvas.setCursor(LOCAL_X, LOCAL_TEMP_Y);
-  localCanvas.printf("%.1f%s", displayLocalTemp, unit);
+    localCanvas.setTextColor(col.date);
+    localCanvas.setCursor(LOCAL_X, LOCAL_HUM_Y);
+    localCanvas.printf("HUM: %.0f%%", g_humidity);
 
-  localCanvas.setTextColor(col.date);
-  localCanvas.setCursor(LOCAL_X, LOCAL_HUM_Y);
-  localCanvas.printf("HUM: %.0f%%", g_humidity);
+    tft.drawRGBBitmap(0, 5, localCanvas.getBuffer(), 150, 40); // push to screen in one shot
+  }
 
-  localCanvas.setCursor(LOCAL_X, LOCAL_PRES_Y);
-  localCanvas.printf("%.0f hPa", g_pressure);
+  // Air quality — bottom of screen
+  // CO2 from SCD40 shows as soon as data arrives
+  // VOC and NOx from SGP41 wait for warmup
+  if (hasSCD40Data) {
+    aqCanvas.fillScreen(ILI9341_BLACK);
+    aqCanvas.setFont(&FreeMono9pt7b);
 
-  tft.drawRGBBitmap(0, 5, localCanvas.getBuffer(), 150, 55); // push to screen in one shot
+    // CO2 — color changes based on level
+    aqCanvas.setTextColor(getCO2Color(col));
+    aqCanvas.setCursor(AQ_CO2_X - 30, 15);
+    aqCanvas.printf("CO2:%dppm", g_co2);
+
+    // VOC and NOx — only show after SGP41 warmup
+    if (hasSGP41Data) {
+      aqCanvas.setTextColor(col.date);
+      aqCanvas.setCursor(AQ_VOC_X - 30, 15);
+      aqCanvas.printf("VOC:%d", g_voc);
+
+      aqCanvas.setCursor(AQ_NOX_X - 30, 15);
+      aqCanvas.printf("NOx:%d", g_nox);
+    }
+
+    tft.drawRGBBitmap(30, 210, aqCanvas.getBuffer(), 290, 20); // push to screen in one shot
+  }
 }
 
 void drawWiFiIcon(int x, int y) {
@@ -591,8 +668,8 @@ void drawScrollbar() {
   int thumbH = (visible * trackH) / itemCount; // thumb height proportional to visible ratio
   int thumbY = trackY + (menuOffset * trackH) / itemCount; // moves down as menuOffset increases
 
-  tft.fillRect(trackX, trackY, 4, trackH, 0x2104);        // dim grey track
-  tft.fillRect(trackX, thumbY, 4, thumbH, ILI9341_CYAN);  // cyan thumb
+  tft.fillRect(trackX, trackY, 4, trackH, 0x2104);       // dim grey track
+  tft.fillRect(trackX, thumbY, 4, thumbH, ILI9341_CYAN); // cyan thumb
 }
 
 // Draws the full menu with the current item highlighted
@@ -972,7 +1049,7 @@ bool syncLocationAndTime() { // loop() checks WiFi before calling this
   return success;
 }
 
-// Reads TSL2591 and BME280 — writes to g_ globals, never touches the display
+// Reads TSL2591, SCD40, and SGP41 — writes to g_ globals, never touches the display
 void updateLocalSensors() {
   // TSL2591 lux
   uint32_t lum  = tsl.getFullLuminosity();
@@ -985,14 +1062,36 @@ void updateLocalSensors() {
     g_lux = (isnan(lux) || lux < 0 || lux > 88000) ? 0 : lux; // reject invalid results
   }
 
-  // BME280 — temp stored as Fahrenheit, converted at draw time if needed
-  g_localTemp = bme.readTemperature() * 9.0 / 5.0 + 32.0;
-  g_humidity  = bme.readHumidity();
-  g_pressure  = bme.readPressure() / 100.0F; // hPa
-  hasBMEData  = true;
+  // SCD40 — CO2, temperature, humidity
+  // getDataReadyStatus only returns true when a new measurement is available
+  uint16_t co2;
+  float    temp, hum;
+  bool     dataReady = false;
+  scd4x.getDataReadyStatus(dataReady);
+  if (dataReady) {
+    uint16_t error = scd4x.readMeasurement(co2, temp, hum);
+    if (!error && co2 != 0) {
+      g_co2        = co2;
+      g_localTemp  = temp * 9.0 / 5.0 + 32.0; // store as Fahrenheit
+      g_humidity   = hum;
+      hasSCD40Data = true;
+    }
+  }
 
-  Serial.printf("[LUX] %.1f  [TEMP] %.1fF  [HUM] %.1f%%  [PRES] %.0f hPa\n",
-                g_lux, g_localTemp, g_humidity, g_pressure);
+  // SGP41 — VOC index and NOx index
+  // feed SCD40 temp and humidity into compensation algorithm for accurate readings
+  uint16_t srawVoc = 0, srawNox = 0;
+  uint16_t rhComp  = hasSCD40Data ? (uint16_t)(g_humidity * 65535.0 / 100.0) : 0x8000;
+  uint16_t tComp   = hasSCD40Data ? (uint16_t)(((g_localTemp - 32.0) * 5.0 / 9.0 + 45.0) * 65535.0 / 175.0) : 0x6666;
+
+  if (sgp41.measureRawSignals(rhComp, tComp, srawVoc, srawNox) == 0) {
+    g_voc        = vocAlgorithm.process(srawVoc);
+    g_nox        = noxAlgorithm.process(srawNox);
+    hasSGP41Data = true;
+  }
+
+  Serial.printf("[LUX] %.1f  [CO2] %d ppm  [TEMP] %.1fF  [HUM] %.1f%%  [VOC] %d  [NOx] %d\n",
+                g_lux, g_co2, g_localTemp, g_humidity, g_voc, g_nox);
 }
 
 // =============================================================================
