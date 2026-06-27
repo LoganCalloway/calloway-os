@@ -9,8 +9,8 @@
 //  Project      : Calloway OS
 //  Product      : Omni-Core Telemetry Station
 //  Platform     : XIAO ESP32-C6
-//  Display      : ILI9341 2.8" TFT (320x240)
-//  Version      : v1.7
+//  Display      : ST7796 3.5" IPS TFT (480x320) with FT6236 capacitive touch
+//  Version      : v1.8
 //  Author       : Logan Calloway
 //  License      : Copyright (c) 2025 Logan Calloway. All Rights Reserved.
 //                 Unauthorized copying, distribution, or modification of
@@ -23,7 +23,7 @@
 //    (VOC index, NOx index). Has a scrollable settings menu navigated by a
 //    single hardware button. All settings persist across reboots via NVS.
 //    Auto Dim drives the backlight from the TSL2591 lux reading once the
-//    PFET is wired up.
+//    PFET is wired up. Touch support (FT6236) coming in stage 2.
 // -----------------------------------------------------------------------------
 //  How it's organized :
 //    DATA LAYER    — functions that fetch or calculate data, never draw
@@ -36,8 +36,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
+#include <Arduino_GFX_Library.h>
 #include <Adafruit_TSL2591.h>
 #include <SensirionI2cScd4x.h>
 #include <SensirionI2CSgp41.h>
@@ -48,15 +47,33 @@
 #include <esp_task_wdt.h>
 
 #include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
 #include "secrets.h"
 
 // =============================================================================
+// COLOR DEFINITIONS — replaces ILI9341_ constants
+// =============================================================================
+#define TFT_BLACK       0x0000
+#define TFT_WHITE       0xFFFF
+#define TFT_RED         0xF800
+#define TFT_GREEN       0x07E0
+#define TFT_BLUE        0x001F
+#define TFT_CYAN        0x07FF
+#define TFT_MAGENTA     0xF81F
+#define TFT_YELLOW      0xFFE0
+#define TFT_ORANGE      0xFD20
+#define TFT_DARKGREY    0x7BEF
+#define TFT_LIGHTGREY   0xC618
+#define TFT_MAROON      0x7800
+
+
+// =============================================================================
 // CONFIGURATION
 // =============================================================================
-#define OS_VERSION    "CALLOWAY_OS v1.7"
+#define OS_VERSION    "CALLOWAY_OS v1.8"
 const char* weatherKey  = WEATHER_API_KEY;
 String currentCity      = "Asheville,US";   // gets updated by syncLocationAndTime()
 long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTime()
@@ -70,43 +87,50 @@ long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTi
 #define TFT_DC    D3
 #define TFT_SDA   D4  // I2C data
 #define TFT_SCL   D5  // I2C clock
-#define RESET_PIN D6  // settings button
+#define RESET_PIN D6  // settings button — deep reset only once touch is active
+#define CTP_RST   D7  // touch controller reset
+#define TFT_SCK   D8  // SPI clock
+#define CTP_INT   D9  // touch interrupt
+#define TFT_MOSI  D10 // SPI data
 
 // =============================================================================
 // LAYOUT CONSTANTS — change these to move things around on screen
 // =============================================================================
-#define WEATHER_X       165
+#define SCREEN_W        480
+#define SCREEN_H        320
+
+#define WEATHER_X       290
 #define WEATHER_CITY_Y   20
 #define WEATHER_TEMP_Y   45
-#define WEATHER_HILO_Y   62
-#define WEATHER_LOW_X   235
-#define CLOCK_X          50
-#define CLOCK_Y          75
-#define DATE_X           65
-#define DATE_Y          145
-#define DIVIDER_Y       165
-#define WIFI_ICON_X     295
+#define WEATHER_HILO_Y   65
+#define WEATHER_LOW_X   380
+#define CLOCK_X          80
+#define CLOCK_Y          95
+#define DATE_X           90
+#define DATE_Y          175
+#define DIVIDER_Y       195
+#define WIFI_ICON_X     450
 #define WIFI_ICON_Y      15
 
 // Light sensor bar
-#define LUX_BAR_X       10
-#define LUX_BAR_Y      170
-#define LUX_BAR_WIDTH   12
-#define LUX_BAR_HEIGHT  60
+#define LUX_BAR_X       15
+#define LUX_BAR_Y      210
+#define LUX_BAR_WIDTH   14
+#define LUX_BAR_HEIGHT  90
 #define LUX_MAX        400  // tweak to match your room — 400 works well indoors
 
 // Local sensor readings — top left (SCD40 temp and humidity)
-#define LOCAL_X        5
-#define LOCAL_TEMP_Y   20
-#define LOCAL_HUM_Y    35
+#define LOCAL_X         5
+#define LOCAL_TEMP_Y    20
+#define LOCAL_HUM_Y     38
 
 // Air quality readings — bottom of screen
-#define AQ_CO2_X       30   // CO2 bottom left
-#define AQ_CO2_Y      220
-#define AQ_VOC_X      130   // VOC index bottom middle
-#define AQ_VOC_Y      220
-#define AQ_NOX_X      220   // NOx index bottom right
-#define AQ_NOX_Y      220
+#define AQ_CO2_X        40
+#define AQ_CO2_Y       308
+#define AQ_VOC_X       190
+#define AQ_VOC_Y       308
+#define AQ_NOX_X       330
+#define AQ_NOX_Y       308
 
 // =============================================================================
 // BRIGHTNESS CONSTANTS
@@ -141,17 +165,18 @@ unsigned long lastNtpTime      = 0;
 // =============================================================================
 // OBJECTS
 // =============================================================================
-Adafruit_ILI9341     tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, GFX_NOT_DEFINED);
+Arduino_GFX     *tft = new Arduino_ST7796(bus, TFT_RST, 3); // 3 = landscape, invertDisplay called in setup
 Adafruit_TSL2591     tsl = Adafruit_TSL2591(2591);
 SensirionI2cScd4x    scd4x;
 SensirionI2CSgp41    sgp41;
 VOCGasIndexAlgorithm vocAlgorithm;
 NOxGasIndexAlgorithm noxAlgorithm;
 Preferences          prefs;
-GFXcanvas16          clockCanvas(260, 45); // clock buffer — prevents flicker on second updates
-GFXcanvas16          localCanvas(150, 40); // local sensor buffer — temp and humidity
-GFXcanvas16          aqCanvas(290, 20);    // air quality buffer — CO2, VOC, NOx
-GFXcanvas16          dateCanvas(240, 20);  // date buffer — prevents flicker on minute updates
+GFXcanvas16          clockCanvas(420, 65); // clock buffer — wider for bigger display
+GFXcanvas16          localCanvas(200, 45); // local sensor buffer — temp and humidity
+GFXcanvas16          aqCanvas(440, 22);    // air quality buffer — CO2, VOC, NOx
+GFXcanvas16          dateCanvas(320, 22);  // date buffer — prevents flicker on minute updates
 
 // =============================================================================
 // STATE
@@ -213,11 +238,11 @@ ColorPalette getColorPalette() {
              0x4000, 0x8400, 0x8000 };
   } else {
     return {
-      ILI9341_WHITE, ILI9341_LIGHTGREY, ILI9341_YELLOW,
-      ILI9341_DARKGREY, ILI9341_LIGHTGREY, ILI9341_ORANGE,
-      ILI9341_RED, ILI9341_CYAN,
-      ILI9341_YELLOW, 0x2104, ILI9341_GREEN, ILI9341_RED,
-      ILI9341_GREEN, ILI9341_YELLOW, ILI9341_RED
+      TFT_WHITE, TFT_LIGHTGREY, TFT_YELLOW,
+      TFT_DARKGREY, TFT_LIGHTGREY, TFT_ORANGE,
+      TFT_RED, TFT_CYAN,
+      TFT_YELLOW, 0x2104, TFT_GREEN, TFT_RED,
+      TFT_GREEN, TFT_YELLOW, TFT_RED
     };
   }
 }
@@ -289,9 +314,10 @@ void setup() {
   loadSettings();
   // applyBrightness(); // uncomment when PFET is wired
 
-  tft.begin();
-  tft.setRotation(3);
-  tft.fillScreen(ILI9341_BLACK);
+  tft->begin();
+  tft->invertDisplay(true); // ST7796 requires invert for correct colors
+  tft->setRotation(3);
+  tft->fillScreen(TFT_BLACK);
 
   showSplashScreen();
 
@@ -333,7 +359,7 @@ void setup() {
   manageWiFiVault();     // blocks here until connected — watchdog not armed yet
   syncLocationAndTime();
 
-  tft.fillScreen(ILI9341_BLACK);
+  tft->fillScreen(TFT_BLACK);
 
   // Watchdog armed after all blocking startup is done.
   // If loop() stalls for more than 30s the chip resets itself.
@@ -411,38 +437,38 @@ void updateTimeDisplay() {
       char dateBuf[25];
       strftime(dateBuf, 25, "%A, %b %d", &timeinfo);
 
-      dateCanvas.fillScreen(ILI9341_BLACK);
+      dateCanvas.fillScreen(TFT_BLACK);
       dateCanvas.setFont(&FreeSans9pt7b);
       dateCanvas.setTextColor(col.date);
-      dateCanvas.setCursor(DATE_X - 40, 15); // offset — canvas starts at x=40 on screen
+      dateCanvas.setCursor(DATE_X - 60, 17);
       dateCanvas.print(dateBuf);
 
-      tft.drawRGBBitmap(40, 130, dateCanvas.getBuffer(), 240, 20); // push in one shot
-      tft.drawFastHLine(40, DIVIDER_Y, 240, col.line);
+      tft->draw16bitRGBBitmap(60, 158, dateCanvas.getBuffer(), 320, 22);
+      tft->drawFastHLine(60, DIVIDER_Y, 320, col.line);
       lastMin = timeinfo.tm_min;
     }
 
-    clockCanvas.fillScreen(ILI9341_BLACK); // wipe canvas before drawing new time
-    clockCanvas.setFont(&FreeSansBold18pt7b);
+    clockCanvas.fillScreen(TFT_BLACK);
+    clockCanvas.setFont(&FreeSansBold24pt7b); // big font for the time digits
     clockCanvas.setTextColor(col.clock);
-    clockCanvas.setCursor(5, 32);
+    clockCanvas.setCursor(5, 50);
 
     if (isMilitaryTime) {
       // 24hr — no AM/PM
       clockCanvas.printf("%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     } else {
-      // 12hr — convert hour and draw AM/PM after
+      // 12hr — convert hour and draw AM/PM small after
       int hour12 = timeinfo.tm_hour % 12;
       if (hour12 == 0) hour12 = 12;
       clockCanvas.printf("%d:%02d:%02d", hour12, timeinfo.tm_min, timeinfo.tm_sec);
       int endX = clockCanvas.getCursorX();
-      clockCanvas.setFont(&FreeSans9pt7b);
+      clockCanvas.setFont(&FreeSans9pt7b); // small font for AM/PM
       clockCanvas.setTextColor(col.ampm);
-      clockCanvas.setCursor(endX + 6, 32);
+      clockCanvas.setCursor(endX + 6, 40);
       clockCanvas.print((timeinfo.tm_hour >= 12) ? "PM" : "AM");
     }
 
-    tft.drawRGBBitmap(CLOCK_X, CLOCK_Y, clockCanvas.getBuffer(), 260, 45); // push to screen in one shot
+    tft->draw16bitRGBBitmap(CLOCK_X, CLOCK_Y, clockCanvas.getBuffer(), 420, 65);
     lastSec = timeinfo.tm_sec;
   }
 }
@@ -458,24 +484,24 @@ void updateWeatherDisplay() {
   float displayLow  = isCelsius ? (g_tempLow     - 32) * 5.0 / 9.0 : g_tempLow;
   const char* unit  = isCelsius ? "C" : "F";
 
-  tft.fillRect(160, 5, 155, 75, ILI9341_BLACK);
-  tft.setFont(&FreeMono9pt7b);
+  tft->fillRect(280, 5, 195, 80, TFT_BLACK);
+  tft->setFont(&FreeMono9pt7b);
 
-  tft.setTextColor(col.city);
-  tft.setCursor(WEATHER_X, WEATHER_CITY_Y);
-  tft.print(currentCity.substring(0, currentCity.indexOf(','))); // drop the country code
+  tft->setTextColor(col.city);
+  tft->setCursor(WEATHER_X, WEATHER_CITY_Y);
+  tft->print(currentCity.substring(0, currentCity.indexOf(','))); // drop the country code
 
-  tft.setTextColor(col.temp);
-  tft.setCursor(WEATHER_X, WEATHER_TEMP_Y);
-  tft.printf("%.0f%s %s", displayTemp, unit, g_skyStatus.c_str());
+  tft->setTextColor(col.temp);
+  tft->setCursor(WEATHER_X, WEATHER_TEMP_Y);
+  tft->printf("%.0f%s %s", displayTemp, unit, g_skyStatus.c_str());
 
-  tft.setTextColor(col.high);
-  tft.setCursor(WEATHER_X, WEATHER_HILO_Y);
-  tft.printf("H:%.0f", displayHigh);
+  tft->setTextColor(col.high);
+  tft->setCursor(WEATHER_X, WEATHER_HILO_Y);
+  tft->printf("H:%.0f", displayHigh);
 
-  tft.setTextColor(col.low);
-  tft.setCursor(WEATHER_LOW_X, WEATHER_HILO_Y);
-  tft.printf("L:%.0f", displayLow);
+  tft->setTextColor(col.low);
+  tft->setCursor(WEATHER_LOW_X, WEATHER_HILO_Y);
+  tft->printf("L:%.0f", displayLow);
 }
 
 // Draws lux bar, SCD40 local readings, and SGP41 air quality
@@ -484,15 +510,15 @@ void updateSensorDisplay() {
 
   // lux bar — always draws
   int fillHeight = map(constrain((int)g_lux, 0, LUX_MAX), 0, LUX_MAX, 0, LUX_BAR_HEIGHT);
-  tft.fillRect(LUX_BAR_X, LUX_BAR_Y, LUX_BAR_WIDTH, LUX_BAR_HEIGHT, col.luxBg);
-  tft.fillRect(LUX_BAR_X, LUX_BAR_Y + (LUX_BAR_HEIGHT - fillHeight), LUX_BAR_WIDTH, fillHeight, col.luxBar);
+  tft->fillRect(LUX_BAR_X, LUX_BAR_Y, LUX_BAR_WIDTH, LUX_BAR_HEIGHT, col.luxBg);
+  tft->fillRect(LUX_BAR_X, LUX_BAR_Y + (LUX_BAR_HEIGHT - fillHeight), LUX_BAR_WIDTH, fillHeight, col.luxBar);
 
   // SCD40 — top left, temp and humidity, draws as soon as first read succeeds
   if (hasSCD40Data) {
     float displayLocalTemp = isCelsius ? (g_localTemp - 32) * 5.0 / 9.0 : g_localTemp;
     const char* unit = isCelsius ? "C" : "F";
 
-    localCanvas.fillScreen(ILI9341_BLACK);
+    localCanvas.fillScreen(TFT_BLACK);
     localCanvas.setFont(&FreeMono9pt7b);
 
     localCanvas.setTextColor(col.temp);
@@ -503,14 +529,14 @@ void updateSensorDisplay() {
     localCanvas.setCursor(LOCAL_X, LOCAL_HUM_Y);
     localCanvas.printf("HUM: %.0f%%", g_humidity);
 
-    tft.drawRGBBitmap(0, 5, localCanvas.getBuffer(), 150, 40); // push to screen in one shot
+    tft->draw16bitRGBBitmap(0, 5, localCanvas.getBuffer(), 200, 45);
   }
 
   // Air quality — bottom of screen
   // CO2 from SCD40 shows as soon as data arrives
   // VOC and NOx from SGP41 wait for warmup
   if (hasSCD40Data) {
-    aqCanvas.fillScreen(ILI9341_BLACK);
+    aqCanvas.fillScreen(TFT_BLACK);
     aqCanvas.setFont(&FreeMono9pt7b);
 
     // CO2 — color changes based on level
@@ -528,7 +554,7 @@ void updateSensorDisplay() {
       aqCanvas.printf("NOx:%d", g_nox);
     }
 
-    tft.drawRGBBitmap(30, 210, aqCanvas.getBuffer(), 290, 20); // push to screen in one shot
+    tft->draw16bitRGBBitmap(30, 296, aqCanvas.getBuffer(), 440, 22);
   }
 }
 
@@ -538,29 +564,29 @@ void drawWiFiIcon(int x, int y) {
   int  bars         = !connected ? 0 : (WiFi.RSSI() > -60) ? 4 : (WiFi.RSSI() > -80) ? 2 : 1;
   uint16_t active   = connected ? col.wifiActive : col.wifiInactive;
   for (int i = 0; i < 4; i++) {
-    tft.fillRect(x + (i * 5), y + (10 - (i * 3)), 3, 4 + (i * 3),
-                 (i < bars) ? active : col.luxBg);
+    tft->fillRect(x + (i * 6), y + (12 - (i * 3)), 4, 4 + (i * 3),
+                  (i < bars) ? active : col.luxBg);
   }
 }
 
 void drawDynamicBorder(float temp) { // border color reflects outside temperature
   uint16_t borderColor;
-  if      (temp >= 85) borderColor = ILI9341_RED;
-  else if (temp >= 70) borderColor = ILI9341_ORANGE;
-  else if (temp >= 55) borderColor = ILI9341_GREEN;
+  if      (temp >= 85) borderColor = TFT_RED;
+  else if (temp >= 70) borderColor = TFT_ORANGE;
+  else if (temp >= 55) borderColor = TFT_GREEN;
   else if (temp >= 40) borderColor = 0x07FF; // cyan
-  else                 borderColor = ILI9341_BLUE;
+  else                 borderColor = TFT_BLUE;
 
-  tft.drawRect(0, 0, 320, 240, borderColor);
-  tft.drawRect(1, 1, 318, 238, borderColor); // double up for a bolder look
+  tft->drawRect(0, 0, 320, 240, borderColor);
+  tft->drawRect(1, 1, 318, 238, borderColor); // double up for a bolder look
 }
 
 void runKITTScanner(int x) { // animated loading bar during WiFi connect
-  int y     = 230, h = 4;
-  int tailX = max(0, x - 15); // clamp so tail never draws off the left edge
-  tft.fillRect(0,     y, 320, h, ILI9341_BLACK);
-  tft.fillRect(tailX, y,  40, h, 0x8000);      // dark red tail
-  tft.fillRect(x,     y,  10, h, ILI9341_RED);  // bright red core
+  int y     = 310, h = 4;
+  int tailX = max(0, x - 15);
+  tft->fillRect(0,     y, 480, h, TFT_BLACK);
+  tft->fillRect(tailX, y,  40, h, 0x8000);
+  tft->fillRect(x,     y,  10, h, TFT_RED);
 }
 
 // =============================================================================
@@ -580,7 +606,7 @@ void openMenu() {
 void closeMenu() {
   menuOpen           = false;
   brightnessSelected = false;
-  tft.fillScreen(ILI9341_BLACK);
+  tft->fillScreen(TFT_BLACK);
   lastMin = -1;
   lastSec = -1; // force a full dashboard redraw
   updateTimeDisplay();
@@ -599,8 +625,8 @@ void navigateMenu() {
     return;
   }
   menuIndex = (menuIndex + 1) % 7;
-  if (menuIndex >= menuOffset + 4) menuOffset++; // scroll down when cursor passes the window
-  if (menuIndex == 0) menuOffset = 0;             // wrap back to top — reset offset too
+  if (menuIndex >= menuOffset + 5) menuOffset++; // 5 visible items on bigger screen
+  if (menuIndex == 0) menuOffset = 0;
   drawMenu();
 }
 
@@ -640,17 +666,17 @@ void selectMenuItem() {
 
     case 5: // Reset WiFi — show confirmation before doing anything
       awaitingResetConfirm = true;
-      tft.fillScreen(ILI9341_BLACK);
-      tft.drawRoundRect(20, 60, 280, 120, 8, ILI9341_RED);
-      tft.setFont(&FreeSans9pt7b);
-      tft.setTextColor(ILI9341_WHITE);
-      tft.setCursor(50, 100);
-      tft.print("Reset WiFi credentials?");
-      tft.setTextColor(ILI9341_LIGHTGREY);
-      tft.setCursor(70, 125);
-      tft.print("Hold to confirm.");
-      tft.setCursor(70, 148);
-      tft.print("Tap to cancel.");
+      tft->fillScreen(TFT_BLACK);
+      tft->drawRoundRect(40, 100, 400, 120, 8, TFT_RED);
+      tft->setFont(&FreeSans9pt7b);
+      tft->setTextColor(TFT_WHITE);
+      tft->setCursor(100, 140);
+      tft->print("Reset WiFi credentials?");
+      tft->setTextColor(TFT_LIGHTGREY);
+      tft->setCursor(130, 165);
+      tft->print("Hold to confirm.");
+      tft->setCursor(130, 188);
+      tft->print("Tap to cancel.");
       break;
 
     case 6: closeMenu(); break;
@@ -660,16 +686,16 @@ void selectMenuItem() {
 // Draws the scrollbar — thumb moves down as you scroll through items
 void drawScrollbar() {
   const int itemCount = 7;
-  const int visible   = 4;
-  const int trackX    = 285;
+  const int visible   = 5;
+  const int trackX    = 450;
   const int trackY    = 68;
-  const int trackH    = 145;
+  const int trackH    = 210;
 
   int thumbH = (visible * trackH) / itemCount; // thumb height proportional to visible ratio
   int thumbY = trackY + (menuOffset * trackH) / itemCount; // moves down as menuOffset increases
 
-  tft.fillRect(trackX, trackY, 4, trackH, 0x2104);       // dim grey track
-  tft.fillRect(trackX, thumbY, 4, thumbH, ILI9341_CYAN); // cyan thumb
+  tft->fillRect(trackX, trackY, 4, trackH, 0x2104);       // dim grey track
+  tft->fillRect(trackX, thumbY, 4, thumbH, TFT_CYAN); // cyan thumb
 }
 
 // Draws the full menu with the current item highlighted
@@ -679,55 +705,54 @@ void drawMenu() {
     "Brightness", "Auto Dim", "Reset WiFi", "Close"
   };
   const int itemCount = 7;
-  const int visible   = 4;
+  const int visible   = 5;
 
-  tft.fillRoundRect(20, 30, 280, 190, 8, 0x1082); // dark background
-  tft.drawRoundRect(20, 30, 280, 190, 8, ILI9341_CYAN);
+  tft->fillRoundRect(20, 40, 440, 240, 8, 0x1082);
+  tft->drawRoundRect(20, 40, 440, 240, 8, TFT_CYAN);
 
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(110, 55);
-  tft.print("SETTINGS");
-  tft.drawFastHLine(30, 62, 260, ILI9341_CYAN);
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(190, 65);
+  tft->print("SETTINGS");
+  tft->drawFastHLine(30, 75, 420, TFT_CYAN);
 
   for (int i = 0; i < visible; i++) {
     int itemIdx = i + menuOffset;
     if (itemIdx >= itemCount) break;
-    int itemY = 90 + (i * 35);
+    int itemY = 105 + (i * 35);
 
     bool isBrightnessAdjusting = (itemIdx == 3 && brightnessSelected);
 
     if (itemIdx == menuIndex) {
-      uint16_t hlColor = isBrightnessAdjusting ? ILI9341_YELLOW : ILI9341_CYAN;
-      tft.fillRoundRect(30, itemY - 16, 250, 26, 4, hlColor); // selected highlight
-      tft.setTextColor(ILI9341_BLACK);
+      uint16_t hlColor = isBrightnessAdjusting ? TFT_YELLOW : TFT_CYAN;
+      tft->fillRoundRect(30, itemY - 16, 410, 26, 4, hlColor);
+      tft->setTextColor(TFT_BLACK);
     } else {
-      tft.setTextColor(ILI9341_WHITE);
+      tft->setTextColor(TFT_WHITE);
     }
 
-    tft.setCursor(45, itemY);
-    tft.print(items[itemIdx]);
+    tft->setCursor(50, itemY);
+    tft->print(items[itemIdx]);
 
-    // show current value on the right for toggleable items
-    tft.setCursor(205, itemY);
-    if (itemIdx == 0) tft.print(isNightMode    ? "ON"  : "OFF");
-    if (itemIdx == 1) tft.print(isCelsius      ? "C"   : "F");
-    if (itemIdx == 2) tft.print(isMilitaryTime ? "ON"  : "OFF");
+    tft->setCursor(340, itemY);
+    if (itemIdx == 0) tft->print(isNightMode    ? "ON"  : "OFF");
+    if (itemIdx == 1) tft->print(isCelsius      ? "C"   : "F");
+    if (itemIdx == 2) tft->print(isMilitaryTime ? "ON"  : "OFF");
     if (itemIdx == 3) {
       int pct = map(BRIGHTNESS_STEPS[brightness], 191, 0, 25, 100);
-      tft.printf("%d%%", pct);
+      tft->printf("%d%%", pct);
     }
-    if (itemIdx == 4) tft.print(isAutoDim ? "ON" : "OFF");
+    if (itemIdx == 4) tft->print(isAutoDim ? "ON" : "OFF");
   }
 
   drawScrollbar();
 
   // hint text when in brightness adjust mode
   if (brightnessSelected) {
-    tft.setFont(NULL);
-    tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(55, 217);
-    tft.print("Tap to adjust, hold to confirm");
+    tft->setFont(NULL);
+    tft->setTextColor(TFT_YELLOW);
+    tft->setCursor(100, 277);
+    tft->print("Tap to adjust, hold to confirm");
   }
 }
 
@@ -866,22 +891,22 @@ void handleDeepReset() {
   delay(100);
   if (digitalRead(RESET_PIN) == LOW) {
     unsigned long startHold = millis();
-    tft.fillScreen(ILI9341_MAROON);
-    tft.setFont(&FreeSans9pt7b);
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setCursor(40, 100);
-    tft.print("KEEP HOLDING TO RESET");
+    tft->fillScreen(TFT_MAROON);
+    tft->setFont(&FreeSans9pt7b);
+    tft->setTextColor(TFT_WHITE);
+    tft->setCursor(80, 140);
+    tft->print("KEEP HOLDING TO RESET");
 
     while (digitalRead(RESET_PIN) == LOW) {
       int barWidth  = map(millis() - startHold, 0, 5000, 0, 240);
       int remaining = 5 - (int)((millis() - startHold) / 1000);
 
-      tft.fillRect(40,  120, barWidth, 10, ILI9341_YELLOW); // progress bar
-      tft.fillRect(130, 135, 60,       40, ILI9341_MAROON); // clear old digit
-      tft.setCursor(140, 160);
-      tft.setFont(&FreeSansBold18pt7b);
-      tft.setTextColor(ILI9341_WHITE);
-      tft.printf("%d", remaining);
+      tft->fillRect(60, 160, barWidth, 10, TFT_YELLOW);
+      tft->fillRect(210, 180, 60, 40, TFT_MAROON);
+      tft->setCursor(220, 210);
+      tft->setFont(&FreeSansBold18pt7b);
+      tft->setTextColor(TFT_WHITE);
+      tft->printf("%d", remaining);
 
       if (millis() - startHold > 5000) { // held long enough — wipe and restart clean
         prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
@@ -895,11 +920,11 @@ void handleDeepReset() {
     }
 
     // released before 5s — nothing happens
-    tft.fillScreen(ILI9341_BLACK);
-    tft.setFont(&FreeSans9pt7b);
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(60, 120);
-    tft.print("Reset cancelled.");
+    tft->fillScreen(TFT_BLACK);
+    tft->setFont(&FreeSans9pt7b);
+    tft->setTextColor(TFT_GREEN);
+    tft->setCursor(150, 160);
+    tft->print("Reset cancelled.");
     delay(1000);
     showSplashScreen();
   }
@@ -922,21 +947,21 @@ void manageWiFiVault() {
 
 // Shows the connect screen and waits for WiFi — runs the KITT scanner while it waits
 void connectToWiFi(String vSSID, String vPASS) {
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setFont(&FreeMono9pt7b);
-  tft.setTextColor(ILI9341_YELLOW);
-  tft.setCursor(10, 25);
-  tft.print(OS_VERSION);
+  tft->fillScreen(TFT_BLACK);
+  tft->setFont(&FreeMono9pt7b);
+  tft->setTextColor(TFT_YELLOW);
+  tft->setCursor(10, 25);
+  tft->print(OS_VERSION);
 
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(20, 170);
-  tft.print("> ESTABLISHING NEURAL LINK");
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(20, 220);
+  tft->print("> ESTABLISHING NEURAL LINK");
 
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(20, 195);
-  tft.print("  TARGET: ");
-  tft.setTextColor(ILI9341_MAGENTA);
-  tft.print(vSSID);
+  tft->setTextColor(TFT_WHITE);
+  tft->setCursor(20, 250);
+  tft->print("  TARGET: ");
+  tft->setTextColor(TFT_MAGENTA);
+  tft->print(vSSID);
 
   WiFi.begin(vSSID.c_str(), vPASS.c_str());
 
@@ -950,30 +975,28 @@ void connectToWiFi(String vSSID, String vPASS) {
     if (scannerX <= 0)   direction =  6;
     runKITTScanner(scannerX);
 
-    if (millis() - lastRetry > 20000) { // re-kick the connection every 20s
+    if (millis() - lastRetry > 20000) {
       WiFi.begin(vSSID.c_str(), vPASS.c_str());
       lastRetry = millis();
-      tft.fillRect(15, 205, 290, 30, ILI9341_BLACK);
-      tft.setFont(NULL);
-      tft.setTextColor(ILI9341_YELLOW);
-      tft.setCursor(20, 208);
-      tft.print("Taking long? Hold button while");
-      tft.setCursor(20, 218);
-      tft.print("plugging in to reset WiFi.");
+      tft->fillRect(15, 268, 450, 30, TFT_BLACK);
+      tft->setFont(NULL);
+      tft->setTextColor(TFT_YELLOW);
+      tft->setCursor(20, 270);
+      tft->print("Taking long? Hold button while plugging in to reset WiFi.");
     }
     delay(20);
   }
 
-  tft.fillRect(15, 205, 290, 30, ILI9341_BLACK);
-  tft.fillRect(0,  230, 320,  4, ILI9341_GREEN);
-  tft.fillRect(15, 160, 290, 60, ILI9341_BLACK);
-  tft.setTextColor(ILI9341_GREEN);
-  tft.setCursor(20, 190);
-  tft.print("> NEURAL LINK ESTABLISHED");
+  tft->fillRect(15, 268, 450, 30, TFT_BLACK);
+  tft->fillRect(0, 308, 480, 4, TFT_GREEN);
+  tft->fillRect(15, 210, 450, 60, TFT_BLACK);
+  tft->setTextColor(TFT_GREEN);
+  tft->setCursor(20, 245);
+  tft->print("> NEURAL LINK ESTABLISHED");
 
   delay(1000);
-  tft.fillScreen(ILI9341_BLACK);
-  tft.drawFastHLine(40, DIVIDER_Y, 240, ILI9341_DARKGREY);
+  tft->fillScreen(TFT_BLACK);
+  tft->drawFastHLine(60, DIVIDER_Y, 320, TFT_DARKGREY);
 }
 
 // No saved credentials — launches a captive portal so the user can enter WiFi details
@@ -1099,29 +1122,29 @@ void updateLocalSensors() {
 // =============================================================================
 
 void showSplashScreen() {
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setFont(&FreeMono9pt7b);
-  tft.setTextColor(ILI9341_YELLOW);
-  tft.setCursor(10, 25);
-  tft.print(OS_VERSION);
-  tft.setFont(&FreeSansBold18pt7b);
-  tft.setTextColor(ILI9341_ORANGE);
-  tft.setCursor(55, 100);
-  tft.print("OMNI-CORE");
+  tft->fillScreen(TFT_BLACK);
+  tft->setFont(&FreeMono9pt7b);
+  tft->setTextColor(TFT_YELLOW);
+  tft->setCursor(10, 25);
+  tft->print(OS_VERSION);
+  tft->setFont(&FreeSansBold18pt7b);
+  tft->setTextColor(TFT_ORANGE);
+  tft->setCursor(130, 170);
+  tft->print("OMNI-CORE");
 }
 
 void showSetupScreen(String apName) {
-  tft.fillScreen(0x0010);
-  tft.drawRoundRect(10, 10, 300, 220, 10, ILI9341_CYAN);
-  tft.setFont(&FreeSansBold18pt7b);
-  tft.setTextColor(ILI9341_YELLOW);
-  tft.setCursor(45, 60);
-  tft.print("SETUP MODE");
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(30, 110);
-  tft.print("1. Connect Phone to WiFi:");
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(60, 140);
-  tft.print(apName);
+  tft->fillScreen(0x0010);
+  tft->drawRoundRect(20, 20, 440, 280, 10, TFT_CYAN);
+  tft->setFont(&FreeSansBold18pt7b);
+  tft->setTextColor(TFT_YELLOW);
+  tft->setCursor(140, 100);
+  tft->print("SETUP MODE");
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_WHITE);
+  tft->setCursor(60, 160);
+  tft->print("1. Connect Phone to WiFi:");
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(130, 190);
+  tft->print(apName);
 }
