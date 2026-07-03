@@ -10,7 +10,7 @@
 //  Product      : Omni-Core Telemetry Station
 //  Platform     : XIAO ESP32-C6
 //  Display      : ST7796 3.5" IPS TFT (480x320) with FT6236 capacitive touch
-//  Version      : v1.8
+//  Version      : v1.9
 //  Author       : Logan Calloway
 //  License      : Copyright (c) 2025 Logan Calloway. All Rights Reserved.
 //                 Unauthorized copying, distribution, or modification of
@@ -20,10 +20,17 @@
 //    A desktop engineering dashboard built on the XIAO ESP32-C6. Pulls time
 //    from NTP, weather from OpenWeatherMap, and reads live environmental data
 //    from the TSL2591 (light), SCD40 (CO2, temp, humidity), and SGP41
-//    (VOC index, NOx index). Has a scrollable settings menu navigated by a
-//    single hardware button. All settings persist across reboots via NVS.
-//    Auto Dim drives the backlight from the TSL2591 lux reading once the
-//    PFET is wired up. Touch support (FT6236) coming in stage 2.
+//    (VOC index, NOx index). Full capacitive touch menu via FT6236. Settings
+//    persist across reboots via NVS. Auto Dim drives the backlight from the
+//    TSL2591 lux reading once the PFET is wired up.
+// -----------------------------------------------------------------------------
+//  Touch interaction :
+//    Tap dashboard       — opens settings menu
+//    Tap menu item       — toggles or acts immediately
+//    Swipe up/down       — scrolls menu list
+//    Tap X button        — closes menu
+//    Brightness item     — opens slider, drag to adjust live
+//    Reset WiFi item     — shows YES/NO confirmation screen
 // -----------------------------------------------------------------------------
 //  How it's organized :
 //    DATA LAYER    — functions that fetch or calculate data, never draw
@@ -37,6 +44,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
+#include <Adafruit_FT6206.h>
 #include <Adafruit_TSL2591.h>
 #include <SensirionI2cScd4x.h>
 #include <SensirionI2CSgp41.h>
@@ -46,15 +54,15 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 
-#include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeMono9pt7b.h>
 
 #include "secrets.h"
 
 // =============================================================================
-// COLOR DEFINITIONS — replaces ILI9341_ constants
+// COLOR DEFINITIONS
 // =============================================================================
 #define TFT_BLACK       0x0000
 #define TFT_WHITE       0xFFFF
@@ -69,32 +77,30 @@
 #define TFT_LIGHTGREY   0xC618
 #define TFT_MAROON      0x7800
 
-
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
-#define OS_VERSION    "CALLOWAY_OS v1.8"
+#define OS_VERSION    "CALLOWAY_OS v1.9"
 const char* weatherKey  = WEATHER_API_KEY;
-String currentCity      = "Asheville,US";   // gets updated by syncLocationAndTime()
-long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTime()
+String currentCity      = "Asheville,US";
+long   currentUtcOffset = -14400;
 
 // =============================================================================
 // PIN MAPPING
 // =============================================================================
 #define TFT_RST   D0
 #define TFT_CS    D1
-#define TFT_PWM   D2  // backlight PWM — inverted when PFET is wired (255 = off, 0 = full)
+#define TFT_PWM   D2  // backlight PWM — inverted when PFET is wired
 #define TFT_DC    D3
 #define TFT_SDA   D4  // I2C data
 #define TFT_SCL   D5  // I2C clock
-#define RESET_PIN D6  // settings button — deep reset only once touch is active
 #define CTP_RST   D7  // touch controller reset
 #define TFT_SCK   D8  // SPI clock
 #define CTP_INT   D9  // touch interrupt
 #define TFT_MOSI  D10 // SPI data
 
 // =============================================================================
-// LAYOUT CONSTANTS — change these to move things around on screen
+// LAYOUT CONSTANTS
 // =============================================================================
 #define SCREEN_W        480
 #define SCREEN_H        320
@@ -117,14 +123,14 @@ long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTi
 #define LUX_BAR_Y      210
 #define LUX_BAR_WIDTH   14
 #define LUX_BAR_HEIGHT  90
-#define LUX_MAX        400  // tweak to match your room — 400 works well indoors
+#define LUX_MAX        150
 
-// Local sensor readings — top left (SCD40 temp and humidity)
+// Local sensor readings — top left
 #define LOCAL_X         5
 #define LOCAL_TEMP_Y    20
 #define LOCAL_HUM_Y     38
 
-// Air quality readings — bottom of screen
+// Air quality — bottom of screen
 #define AQ_CO2_X        40
 #define AQ_CO2_Y       308
 #define AQ_VOC_X       190
@@ -132,29 +138,45 @@ long   currentUtcOffset = -14400;           // gets updated by syncLocationAndTi
 #define AQ_NOX_X       330
 #define AQ_NOX_Y       308
 
+// Menu geometry
+#define MENU_X          20
+#define MENU_Y          40
+#define MENU_W         440
+#define MENU_H         240
+#define MENU_ITEM_H     35
+#define MENU_FIRST_Y   105 // Y of first item text baseline
+#define MENU_CLOSE_X   430 // X button position
+#define MENU_CLOSE_Y    55
+
+// Brightness slider
+#define SLIDER_X        40
+#define SLIDER_Y       160
+#define SLIDER_W       360
+#define SLIDER_H        12
+#define SLIDER_THUMB_R  14
+
 // =============================================================================
 // BRIGHTNESS CONSTANTS
 // =============================================================================
-// Steps the user cycles through in the menu — 25%, 50%, 75%, 100%
-// Inverted for PFET: high PWM = gate pulled toward source = FET more off = dimmer
-const int BRIGHTNESS_STEPS[] = { 191, 127, 63, 0 };
+// Steps the user cycles through — 25%, 50%, 75%, 100%
+const int BRIGHTNESS_STEPS[] = { 64, 127, 191, 255 };
 const int BRIGHTNESS_COUNT   = 4;
-const int AUTO_DIM_MIN       = 191; // dimmest auto dim will go
-const int AUTO_DIM_MAX       = 0;   // brightest auto dim will go
+const int AUTO_DIM_MIN       = 10;  // dimmest auto dim will go
+const int AUTO_DIM_MAX       = 255; // brightest auto dim will go
 
 // =============================================================================
 // WEATHER CONSTANTS
 // =============================================================================
-const int FORECAST_PERIODS_24H = 8; // 8 x 3hr intervals = 24hr lookahead
+const int FORECAST_PERIODS_24H = 8;
 
 // =============================================================================
 // TIMING INTERVALS
 // =============================================================================
-const long clockInterval    =    100;   // 0.1s  — clock redraw
-const long wifiIconInterval =   5000;   // 5s    — WiFi icon redraw
-const long sensorInterval   =   1000;   // 1s    — check sensors, SCD40 controls its own timing
-const long weatherInterval  = 900000;   // 15min — weather fetch
-const long ntpInterval      = 3600000;  // 1h    — NTP resync
+const long clockInterval    =    100;
+const long wifiIconInterval =   5000;
+const long sensorInterval   =   1000;
+const long weatherInterval  = 900000;
+const long ntpInterval      = 3600000;
 
 unsigned long lastClockTime    = 0;
 unsigned long lastWifiIconTime = 0;
@@ -165,53 +187,62 @@ unsigned long lastNtpTime      = 0;
 // =============================================================================
 // OBJECTS
 // =============================================================================
-Arduino_DataBus *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, GFX_NOT_DEFINED);
-Arduino_GFX     *tft = new Arduino_ST7796(bus, TFT_RST, 3); // 3 = landscape, invertDisplay called in setup
-Adafruit_TSL2591     tsl = Adafruit_TSL2591(2591);
-SensirionI2cScd4x    scd4x;
-SensirionI2CSgp41    sgp41;
+Arduino_DataBus  *bus = new Arduino_ESP32SPI(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, GFX_NOT_DEFINED);
+Arduino_GFX      *tft = new Arduino_ST7796(bus, TFT_RST, 3);
+Adafruit_FT6206   touch;
+Adafruit_TSL2591  tsl = Adafruit_TSL2591(2591);
+SensirionI2cScd4x scd4x;
+SensirionI2CSgp41 sgp41;
 VOCGasIndexAlgorithm vocAlgorithm;
 NOxGasIndexAlgorithm noxAlgorithm;
-Preferences          prefs;
-GFXcanvas16          clockCanvas(420, 65); // clock buffer — wider for bigger display
-GFXcanvas16          localCanvas(200, 45); // local sensor buffer — temp and humidity
-GFXcanvas16          aqCanvas(440, 22);    // air quality buffer — CO2, VOC, NOx
-GFXcanvas16          dateCanvas(320, 22);  // date buffer — prevents flicker on minute updates
+Preferences       prefs;
+
+GFXcanvas16 clockCanvas(420, 65);  // bigger for 24pt font
+GFXcanvas16 localCanvas(200, 45);
+GFXcanvas16 aqCanvas(440, 22);
+GFXcanvas16 dateCanvas(320, 22);
 
 // =============================================================================
 // STATE
 // =============================================================================
-int  lastMin = -1, lastSec = -1;  // only redraw when something actually changed
+int  lastMin = -1, lastSec = -1;
 bool isNightMode          = false;
-bool hasWeatherData       = false; // don't draw weather until we have real data
-bool hasSCD40Data         = false; // don't draw local sensors until first read
-bool hasSGP41Data         = false; // don't draw air quality until warmup completes
-bool isCelsius            = false; // temp unit — false = Fahrenheit
-bool isMilitaryTime       = false; // 24hr clock toggle
-bool isAutoDim            = false; // auto dim from TSL2591 — activates when PFET is wired
-int  brightness           = 3;    // index into BRIGHTNESS_STEPS[] — 3 = full brightness
-bool menuOpen             = false; // is the settings menu showing
-bool awaitingResetConfirm = false; // waiting for user to confirm WiFi reset
-int  menuIndex            = 0;    // which menu item is currently highlighted
-int  menuOffset           = 0;    // first visible menu item — drives scrolling
-bool brightnessSelected   = false; // true when user is in brightness adjust mode
+bool hasWeatherData       = false;
+bool hasSCD40Data         = false;
+bool hasSGP41Data         = false;
+bool isCelsius            = false;
+bool isMilitaryTime       = false;
+bool isAutoDim            = false;
+int  brightness           = 3;
+bool menuOpen             = false;
+bool brightnessSliderOpen = false; // true when brightness sub-screen is showing
+bool awaitingResetConfirm = false;
+int  menuOffset           = 0;
 
-// Weather globals — fetchWeather() writes these, updateWeatherDisplay() reads them
+// Touch tracking
+bool          touchActive     = false;
+int           touchStartX     = 0;
+int           touchStartY     = 0;
+unsigned long touchStartTime  = 0;
+int           lastTouchX      = 0;
+int           lastTouchY      = 0;
+
+// Weather globals
 float  g_currentTemp = 0;
 float  g_tempHigh    = 0;
 float  g_tempLow     = 0;
 String g_skyStatus   = "";
 
-// Sensor globals — updateLocalSensors() writes these, updateSensorDisplay() reads them
+// Sensor globals
 float    g_lux       = 0;
-float    g_localTemp = 0; // SCD40 temp, stored as Fahrenheit
-float    g_humidity  = 0; // SCD40 humidity
-uint16_t g_co2       = 0; // SCD40 CO2 in ppm
-int32_t  g_voc       = 0; // SGP41 VOC index 0-500
-int32_t  g_nox       = 0; // SGP41 NOx index 0-500
+float    g_localTemp = 0;
+float    g_humidity  = 0;
+uint16_t g_co2       = 0;
+int32_t  g_voc       = 0;
+int32_t  g_nox       = 0;
 
 // =============================================================================
-// COLOR PALETTE — one place for all colors, works for both day and night mode
+// COLOR PALETTE
 // =============================================================================
 struct ColorPalette {
   uint16_t clock;
@@ -222,13 +253,13 @@ struct ColorPalette {
   uint16_t temp;
   uint16_t high;
   uint16_t low;
-  uint16_t luxBar;       // light bar fill color
-  uint16_t luxBg;        // light bar background
-  uint16_t wifiActive;   // WiFi icon when connected
-  uint16_t wifiInactive; // WiFi icon when disconnected
-  uint16_t co2Good;      // CO2 color when levels are normal
-  uint16_t co2Warn;      // CO2 color when levels are elevated
-  uint16_t co2High;      // CO2 color when levels are high
+  uint16_t luxBar;
+  uint16_t luxBg;
+  uint16_t wifiActive;
+  uint16_t wifiInactive;
+  uint16_t co2Good;
+  uint16_t co2Warn;
+  uint16_t co2High;
 };
 
 ColorPalette getColorPalette() {
@@ -247,8 +278,6 @@ ColorPalette getColorPalette() {
   }
 }
 
-// Returns the right CO2 color based on the current reading
-// Good: <800ppm  Warn: 800-1200ppm  High: >1200ppm
 uint16_t getCO2Color(ColorPalette col) {
   if (g_co2 < 800)  return col.co2Good;
   if (g_co2 < 1200) return col.co2Warn;
@@ -258,48 +287,36 @@ uint16_t getCO2Color(ColorPalette col) {
 // =============================================================================
 // PROTOTYPES
 // =============================================================================
-
-// Splash / setup screens
 void showSplashScreen();
 void showSetupScreen(String apName);
-
-// WiFi management
 void manageWiFiVault();
 void connectToWiFi(String vSSID, String vPASS);
 void launchSetupPortal();
-
-// System
-void handleDeepReset();
-void checkUserButton();
 void checkWiFiHealth();
 void checkDaylightSavings();
 void applyBrightness();
 void loadSettings();
 void saveSettings();
-
-// Button input
-void onShortPress();
-void onLongPress();
-
-// Settings menu
+void checkTouch();
+void handleDashTouch(int x, int y);
+void handleMenuTouch(int x, int y);
+void handleResetConfirmTouch(int x, int y);
+void handleSliderTouch(int x, int y);
+void handleSwipe(int deltaY);
 void openMenu();
 void closeMenu();
-void navigateMenu();
-void selectMenuItem();
+void selectMenuItem(int itemIdx);
 void drawMenu();
 void drawScrollbar();
-
-// DATA LAYER — fetch/calculate only, never touch the display
+void drawBrightnessSlider();
+void drawResetConfirm();
 bool fetchWeather();
 bool syncLocationAndTime();
 void updateLocalSensors();
-
-// DISPLAY LAYER — read globals and draw only, never fetch
 void updateTimeDisplay();
 void updateWeatherDisplay();
 void updateSensorDisplay();
 void drawWiFiIcon(int x, int y);
-void drawDynamicBorder(float temp);
 void runKITTScanner(int x);
 
 // =============================================================================
@@ -309,20 +326,25 @@ void setup() {
   Serial.begin(115200);
 
   ledcAttach(TFT_PWM, 5000, 8);
-
-  // Load saved settings before anything draws so the first frame is correct
   loadSettings();
-  // applyBrightness(); // uncomment when PFET is wired
+  applyBrightness(); // uncomment when PFET is wired
 
   tft->begin();
-  tft->invertDisplay(true); // ST7796 requires invert for correct colors
+  tft->invertDisplay(true);
   tft->setRotation(3);
   tft->fillScreen(TFT_BLACK);
 
   showSplashScreen();
 
-  // I2C bus — shared by TSL2591, SCD40, and SGP41
+  // I2C bus — shared by all sensors and FT6236 touch
   Wire.begin(TFT_SDA, TFT_SCL);
+
+  // FT6236 capacitive touch
+  if (!touch.begin(40)) {
+    Serial.println("[FT6206] Init failed");
+  } else {
+    Serial.println("[FT6206] Ready");
+  }
 
   // TSL2591 light sensor
   tsl.begin();
@@ -330,39 +352,35 @@ void setup() {
   tsl.setTiming(TSL2591_INTEGRATIONTIME_100MS);
   Serial.println("[TSL2591] Started");
 
-  // Reset I2C bus after TSL2591 — TSL2591 leaves bus busy which blocks SCD40
+  // Reset I2C bus after TSL2591 — leaves bus busy which blocks SCD40
   Wire.end();
   delay(50);
   Wire.begin(TFT_SDA, TFT_SCL);
 
-  // SCD40 CO2, temperature, and humidity sensor
-  // stop any previous measurement before starting fresh
+  // Re-init FT6236 after bus reset
+  touch.begin(40);
+
+  // SCD40
   scd4x.begin(Wire, SCD40_I2C_ADDR_62);
   scd4x.stopPeriodicMeasurement();
   delay(200);
   uint16_t scd40Error = scd4x.startPeriodicMeasurement();
-  if (scd40Error) {
-    Serial.println("[SCD40] Init failed");
-  } else {
-    Serial.println("[SCD40] Started");
-  }
+  if (scd40Error) Serial.println("[SCD40] Init failed");
+  else            Serial.println("[SCD40] Started");
 
-  // SGP41 VOC and NOx sensor — conditioning run before first measurement
+  // SGP41
   sgp41.begin(Wire);
-  uint16_t defaultRh      = 0x8000; // 50% RH default during conditioning
-  uint16_t defaultT       = 0x6666; // 25C default during conditioning
-  uint16_t conditioning_s = 0;
-  sgp41.executeConditioning(defaultRh, defaultT, conditioning_s);
+  uint16_t defaultRh = 0x8000;
+  uint16_t defaultT  = 0x6666;
+  uint16_t cond_s    = 0;
+  sgp41.executeConditioning(defaultRh, defaultT, cond_s);
   Serial.println("[SGP41] Started");
 
-  handleDeepReset();
-  manageWiFiVault();     // blocks here until connected — watchdog not armed yet
+  manageWiFiVault();
   syncLocationAndTime();
 
   tft->fillScreen(TFT_BLACK);
 
-  // Watchdog armed after all blocking startup is done.
-  // If loop() stalls for more than 30s the chip resets itself.
   const esp_task_wdt_config_t wdt_config = {
     .timeout_ms     = 30000,
     .idle_core_mask = 0,
@@ -374,17 +392,17 @@ void setup() {
 }
 
 // =============================================================================
-// LOOP — decides when everything runs and gates all network calls behind WiFi
+// LOOP
 // =============================================================================
 void loop() {
   esp_task_wdt_reset();
   unsigned long currentMillis = millis();
 
-  checkUserButton(); // runs every loop so the button always feels instant
+  checkTouch(); // runs every loop — touch must feel instant
 
   if (currentMillis - lastClockTime >= clockInterval) {
     checkWiFiHealth();
-    if (!menuOpen) updateTimeDisplay(); // don't draw over the menu
+    if (!menuOpen) updateTimeDisplay();
     checkDaylightSavings();
     lastClockTime = currentMillis;
   }
@@ -395,17 +413,17 @@ void loop() {
   }
 
   if (currentMillis - lastSensorTime >= sensorInterval) {
-    updateLocalSensors();              // always read — menu doesn't pause sensors
-    // if (isAutoDim) applyBrightness(); // uncomment when PFET is wired
+    updateLocalSensors();
+    applyBrightness();
     if (!menuOpen) updateSensorDisplay();
     lastSensorTime = currentMillis;
   }
 
-  if (WiFi.status() == WL_CONNECTED) { // all network calls gated here
+  if (WiFi.status() == WL_CONNECTED) {
 
     if (currentMillis - lastWeatherTime >= weatherInterval || lastWeatherTime == 0) {
       if (fetchWeather()) {
-        if (!menuOpen) updateWeatherDisplay(); // only draw if menu is closed
+        if (!menuOpen) updateWeatherDisplay();
       } else {
         Serial.printf("[Weather] Fetch failed — retry in 15min\n");
       }
@@ -413,7 +431,7 @@ void loop() {
     }
 
     if (currentMillis - lastNtpTime >= ntpInterval) {
-      if (syncLocationAndTime()) lastWeatherTime = 0; // location may have changed — grab fresh weather
+      if (syncLocationAndTime()) lastWeatherTime = 0;
       else Serial.printf("[NTP] Sync failed — retry in 1hr\n");
       lastNtpTime = currentMillis;
     }
@@ -422,7 +440,412 @@ void loop() {
 }
 
 // =============================================================================
-// DISPLAY LAYER — reads globals and draws to screen, never fetches anything
+// TOUCH INPUT
+// =============================================================================
+
+// Maps raw FT6236 coordinates to display coordinates
+// Raw: X=0-319 (top to bottom), Y=0-478 (right to left)
+// Mapped: 0,0 = top left, 480,320 = bottom right
+void mapTouch(TS_Point p, int &x, int &y) {
+  x = 478 - p.y;
+  y = p.x;
+}
+
+// Main touch handler — runs every loop
+void checkTouch() {
+  if (!touch.touched()) {
+    if (touchActive) {
+      touchActive = false;
+
+      // use start position only — last position from FT6236 is unreliable on lift
+      unsigned long holdTime = millis() - touchStartTime;
+
+      // only process as tap if it was a short touch — not a long hold or drag
+      if (holdTime < 500) {
+        if (awaitingResetConfirm) {
+          handleResetConfirmTouch(touchStartX, touchStartY);
+        } else if (brightnessSliderOpen) {
+          if (touchStartY < SLIDER_Y - 40 || touchStartY > SLIDER_Y + 60) {
+            brightnessSliderOpen = false;
+            saveSettings();
+            drawMenu();
+          }
+        } else if (menuOpen) {
+          handleMenuTouch(touchStartX, touchStartY);
+        } else {
+          handleDashTouch(touchStartX, touchStartY);
+        }
+      }
+    }
+    return;
+  }
+
+  TS_Point p = touch.getPoint();
+  int x, y;
+  mapTouch(p, x, y);
+
+  if (!touchActive) {
+    touchActive    = true;
+    touchStartX    = x;
+    touchStartY    = y;
+    touchStartTime = millis();
+  }
+
+  lastTouchX = x;
+  lastTouchY = y;
+
+  if (brightnessSliderOpen) {
+    handleSliderTouch(x, y);
+  }
+}
+
+// Tap on dashboard — open menu
+void handleDashTouch(int x, int y) {
+  openMenu();
+}
+
+// Tap on menu — figure out what was tapped
+void handleMenuTouch(int x, int y) {
+  // X close button — top right of menu
+  if (x > 415 && x < 455 && y > 42 && y < 72) {
+    closeMenu();
+    return;
+  }
+
+  // tap outside menu box closes it
+  if (x < MENU_X || x > MENU_X + MENU_W || y < MENU_Y || y > MENU_Y + MENU_H) {
+    closeMenu();
+    return;
+  }
+
+  // up arrow button
+  if (x > 335 && x < 370 && y > 253 && y < 278) {
+    if (menuOffset > 0) {
+      menuOffset--;
+      drawMenu();
+    }
+    return;
+  }
+
+  // down arrow button
+  if (x > 380 && x < 415 && y > 253 && y < 278) {
+    if (menuOffset + 5 < 7) {
+      menuOffset++;
+      drawMenu();
+    }
+    return;
+  }
+
+  // check which item row was tapped
+  for (int i = 0; i < 5; i++) {
+    int itemIdx = i + menuOffset;
+    if (itemIdx >= 7) break;
+    int itemTop    = MENU_FIRST_Y - 18 + (i * MENU_ITEM_H);
+    int itemBottom = itemTop + MENU_ITEM_H;
+    if (y >= itemTop && y <= itemBottom) {
+      selectMenuItem(itemIdx);
+      return;
+    }
+  }
+}
+
+// Tap on YES/NO reset confirmation
+void handleResetConfirmTouch(int x, int y) {
+  // YES button — left side
+  if (x > 60 && x < 210 && y > 180 && y < 220) {
+    awaitingResetConfirm = false;
+    prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
+    prefs.begin("settings",  false); prefs.clear(); prefs.end();
+    WiFiManager wm; wm.resetSettings();
+    WiFi.disconnect(true, true);
+    delay(2000);
+    ESP.restart();
+  }
+  // NO button — right side
+  if (x > 270 && x < 420 && y > 180 && y < 220) {
+    awaitingResetConfirm = false;
+    drawMenu();
+  }
+}
+
+// Live brightness slider drag
+void handleSliderTouch(int x, int y) {
+  if (y < SLIDER_Y - 30 || y > SLIDER_Y + 50) return;
+
+  int clampedX = constrain(x, SLIDER_X, SLIDER_X + SLIDER_W);
+  int rawPwm   = map(clampedX, SLIDER_X, SLIDER_X + SLIDER_W, 64, 255);
+
+  // find nearest brightness step
+  int nearest = 0;
+  int minDiff = 999;
+  for (int i = 0; i < BRIGHTNESS_COUNT; i++) {
+    int diff = abs(rawPwm - BRIGHTNESS_STEPS[i]); // direct comparison, no inversion
+    if (diff < minDiff) {
+      minDiff = diff;
+      nearest = i;
+    }
+  }
+
+  if (nearest != brightness) {
+    brightness = nearest;
+    applyBrightness();
+    drawBrightnessSlider();
+  }
+}
+
+// Swipe up/down to scroll menu
+void handleSwipe(int deltaY) {
+  const int itemCount = 7;
+  const int visible   = 5;
+  if (deltaY < -30) {
+    // swipe up — scroll down
+    if (menuOffset + visible < itemCount) {
+      menuOffset++;
+      drawMenu();
+    }
+  } else if (deltaY > 30) {
+    // swipe down — scroll up
+    if (menuOffset > 0) {
+      menuOffset--;
+      drawMenu();
+    }
+  }
+}
+
+// =============================================================================
+// SETTINGS MENU
+// =============================================================================
+
+void openMenu() {
+  menuOpen             = true;
+  brightnessSliderOpen = false;
+  awaitingResetConfirm = false;
+  menuOffset           = 0;
+  drawMenu();
+}
+
+void closeMenu() {
+  menuOpen             = false;
+  brightnessSliderOpen = false;
+  awaitingResetConfirm = false;
+  tft->fillScreen(TFT_BLACK);
+  lastMin = -1;
+  lastSec = -1;
+  updateTimeDisplay();
+  updateWeatherDisplay();
+  updateSensorDisplay();
+  drawWiFiIcon(WIFI_ICON_X, WIFI_ICON_Y);
+}
+
+// Called when a menu item row is tapped
+void selectMenuItem(int itemIdx) {
+  switch (itemIdx) {
+    case 0: // Night Mode
+      isNightMode = !isNightMode;
+      saveSettings();
+      drawMenu();
+      break;
+
+    case 1: // Temp Unit
+      isCelsius = !isCelsius;
+      saveSettings();
+      drawMenu();
+      break;
+
+    case 2: // Military Time
+      isMilitaryTime = !isMilitaryTime;
+      saveSettings();
+      drawMenu();
+      break;
+
+    case 3: // Brightness — open slider sub-screen
+      brightnessSliderOpen = true;
+      drawBrightnessSlider();
+      break;
+
+    case 4: // Auto Dim
+      isAutoDim = !isAutoDim;
+      applyBrightness(); // uncomment when PFET is wired
+      saveSettings();
+      drawMenu();
+      break;
+
+    case 5: // Reset WiFi — show YES/NO confirmation
+      awaitingResetConfirm = true;
+      drawResetConfirm();
+      break;
+
+    case 6: // Close
+      closeMenu();
+      break;
+  }
+}
+
+void drawScrollbar() {
+  const int itemCount = 7;
+  const int visible   = 5;
+  const int trackX    = 450;
+  const int trackY    = 78;
+  const int trackH    = 190;
+
+  int thumbH = (visible * trackH) / itemCount;
+  int thumbY = trackY + (menuOffset * trackH) / itemCount;
+
+  tft->fillRect(trackX, trackY, 4, trackH, 0x2104);
+  tft->fillRect(trackX, thumbY, 4, thumbH, TFT_CYAN);
+}
+
+void drawMenu() {
+  const char* items[] = {
+    "Night Mode", "Temp Unit", "Military Time",
+    "Brightness", "Auto Dim", "Reset WiFi", "Close"
+  };
+  const int itemCount = 7;
+  const int visible   = 5;
+
+  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, 0x1082);
+  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, TFT_CYAN);
+
+  // Title
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(185, 65);
+  tft->print("SETTINGS");
+  tft->drawFastHLine(30, 75, 410, TFT_CYAN);
+
+  // X close button — top right corner
+  tft->setTextColor(TFT_LIGHTGREY);
+  tft->setCursor(MENU_CLOSE_X, MENU_CLOSE_Y);
+  tft->print("X");
+
+  // Menu items
+  for (int i = 0; i < visible; i++) {
+    int itemIdx = i + menuOffset;
+    if (itemIdx >= itemCount) break;
+    int itemY = MENU_FIRST_Y + (i * MENU_ITEM_H);
+
+    // highlight row
+    tft->fillRoundRect(30, itemY - 16, 410, MENU_ITEM_H - 2, 4, 0x0821);
+    tft->setFont(&FreeSans9pt7b);
+    tft->setTextColor(TFT_WHITE);
+    tft->setCursor(50, itemY);
+    tft->print(items[itemIdx]);
+
+    // value on right
+    tft->setCursor(340, itemY);
+    if (itemIdx == 0) tft->print(isNightMode    ? "ON"  : "OFF");
+    if (itemIdx == 1) tft->print(isCelsius      ? "C"   : "F");
+    if (itemIdx == 2) tft->print(isMilitaryTime ? "ON"  : "OFF");
+    if (itemIdx == 3) {
+      int pct = map(BRIGHTNESS_STEPS[brightness], 64, 255, 25, 100);
+      tft->printf("%d%%", pct);
+    }
+    if (itemIdx == 4) tft->print(isAutoDim ? "ON" : "OFF");
+
+    // tap hint arrow
+    tft->setTextColor(TFT_DARKGREY);
+    tft->setCursor(420, itemY);
+    tft->print(">");
+  }
+
+  drawScrollbar();
+
+  // up arrow button
+  tft->fillRoundRect(335, 253, 35, 25, 4, 0x2104);
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(344, 271);
+  tft->print("^");
+
+  // down arrow button
+  tft->fillRoundRect(380, 253, 35, 25, 4, 0x2104);
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(389, 271);
+  tft->print("v");
+
+  tft->setFont(NULL);
+  tft->setTextColor(0x4208);
+  tft->setCursor(30, 278);
+  tft->print("Tap X to close");
+}
+
+// Brightness slider sub-screen — overlays the menu area
+void drawBrightnessSlider() {
+  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, 0x1082);
+  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, TFT_CYAN);
+
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(170, 80);
+  tft->print("BRIGHTNESS");
+  tft->drawFastHLine(30, 90, 410, TFT_CYAN);
+
+  // current percentage label
+  int pct = map(BRIGHTNESS_STEPS[brightness], 64, 255, 25, 100);
+  tft->setFont(&FreeSansBold18pt7b);
+  tft->setTextColor(TFT_WHITE);
+  tft->setCursor(200, 140);
+  tft->printf("%d%%", pct);
+
+  // slider track
+  tft->fillRoundRect(SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H, 6, 0x4208);
+
+  // slider fill — shows brightness level
+  int fillW = map(pct, 25, 100, 0, SLIDER_W);
+  tft->fillRoundRect(SLIDER_X, SLIDER_Y, fillW, SLIDER_H, 6, TFT_CYAN);
+
+  // slider thumb
+  int thumbX = SLIDER_X + fillW;
+  tft->fillCircle(thumbX, SLIDER_Y + SLIDER_H / 2, SLIDER_THUMB_R, TFT_WHITE);
+  tft->drawCircle(thumbX, SLIDER_Y + SLIDER_H / 2, SLIDER_THUMB_R, TFT_CYAN);
+
+  // labels
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_DARKGREY);
+  tft->setCursor(SLIDER_X, SLIDER_Y + 35);
+  tft->print("25%");
+  tft->setCursor(SLIDER_X + SLIDER_W - 25, SLIDER_Y + 35);
+  tft->print("100%");
+
+  // instruction
+  tft->setFont(NULL);
+  tft->setTextColor(0x4208);
+  tft->setCursor(120, 220);
+  tft->print("Drag to adjust  |  Tap outside to save & close");
+}
+
+// WiFi reset confirmation with YES and NO buttons
+void drawResetConfirm() {
+  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, 0x1082);
+  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, TFT_RED);
+
+  tft->setFont(&FreeSans9pt7b);
+  tft->setTextColor(TFT_WHITE);
+  tft->setCursor(100, 100);
+  tft->print("Reset WiFi credentials?");
+
+  tft->setTextColor(TFT_LIGHTGREY);
+  tft->setCursor(80, 130);
+  tft->print("This will erase your saved WiFi and");
+  tft->setCursor(80, 150);
+  tft->print("restart the setup portal.");
+
+  // YES button
+  tft->fillRoundRect(60, 180, 150, 40, 6, TFT_RED);
+  tft->setTextColor(TFT_WHITE);
+  tft->setCursor(115, 205);
+  tft->print("YES");
+
+  // NO button
+  tft->fillRoundRect(270, 180, 150, 40, 6, 0x2104);
+  tft->drawRoundRect(270, 180, 150, 40, 6, TFT_CYAN);
+  tft->setTextColor(TFT_CYAN);
+  tft->setCursor(330, 205);
+  tft->print("NO");
+}
+
+// =============================================================================
+// DISPLAY LAYER
 // =============================================================================
 
 void updateTimeDisplay() {
@@ -433,7 +856,7 @@ void updateTimeDisplay() {
 
   if (timeinfo.tm_sec != lastSec) {
 
-    if (timeinfo.tm_min != lastMin) { // only redraw the date when the minute changes
+    if (timeinfo.tm_min != lastMin) {
       char dateBuf[25];
       strftime(dateBuf, 25, "%A, %b %d", &timeinfo);
 
@@ -449,15 +872,13 @@ void updateTimeDisplay() {
     }
 
     clockCanvas.fillScreen(TFT_BLACK);
-    clockCanvas.setFont(&FreeSansBold24pt7b); // big font for the time digits
+    clockCanvas.setFont(&FreeSansBold24pt7b); // big font for time digits
     clockCanvas.setTextColor(col.clock);
     clockCanvas.setCursor(5, 50);
 
     if (isMilitaryTime) {
-      // 24hr — no AM/PM
       clockCanvas.printf("%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     } else {
-      // 12hr — convert hour and draw AM/PM small after
       int hour12 = timeinfo.tm_hour % 12;
       if (hour12 == 0) hour12 = 12;
       clockCanvas.printf("%d:%02d:%02d", hour12, timeinfo.tm_min, timeinfo.tm_sec);
@@ -478,7 +899,6 @@ void updateWeatherDisplay() {
 
   ColorPalette col = getColorPalette();
 
-  // convert temps if user switched to Celsius — globals always store Fahrenheit
   float displayTemp = isCelsius ? (g_currentTemp - 32) * 5.0 / 9.0 : g_currentTemp;
   float displayHigh = isCelsius ? (g_tempHigh    - 32) * 5.0 / 9.0 : g_tempHigh;
   float displayLow  = isCelsius ? (g_tempLow     - 32) * 5.0 / 9.0 : g_tempLow;
@@ -489,7 +909,7 @@ void updateWeatherDisplay() {
 
   tft->setTextColor(col.city);
   tft->setCursor(WEATHER_X, WEATHER_CITY_Y);
-  tft->print(currentCity.substring(0, currentCity.indexOf(','))); // drop the country code
+  tft->print(currentCity.substring(0, currentCity.indexOf(',')));
 
   tft->setTextColor(col.temp);
   tft->setCursor(WEATHER_X, WEATHER_TEMP_Y);
@@ -504,27 +924,24 @@ void updateWeatherDisplay() {
   tft->printf("L:%.0f", displayLow);
 }
 
-// Draws lux bar, SCD40 local readings, and SGP41 air quality
 void updateSensorDisplay() {
   ColorPalette col = getColorPalette();
 
-  // lux bar — always draws
+  // lux bar
   int fillHeight = map(constrain((int)g_lux, 0, LUX_MAX), 0, LUX_MAX, 0, LUX_BAR_HEIGHT);
   tft->fillRect(LUX_BAR_X, LUX_BAR_Y, LUX_BAR_WIDTH, LUX_BAR_HEIGHT, col.luxBg);
   tft->fillRect(LUX_BAR_X, LUX_BAR_Y + (LUX_BAR_HEIGHT - fillHeight), LUX_BAR_WIDTH, fillHeight, col.luxBar);
 
-  // SCD40 — top left, temp and humidity, draws as soon as first read succeeds
+  // SCD40 — top left
   if (hasSCD40Data) {
     float displayLocalTemp = isCelsius ? (g_localTemp - 32) * 5.0 / 9.0 : g_localTemp;
     const char* unit = isCelsius ? "C" : "F";
 
     localCanvas.fillScreen(TFT_BLACK);
     localCanvas.setFont(&FreeMono9pt7b);
-
     localCanvas.setTextColor(col.temp);
     localCanvas.setCursor(LOCAL_X, LOCAL_TEMP_Y);
     localCanvas.printf("%.1f%s", displayLocalTemp, unit);
-
     localCanvas.setTextColor(col.date);
     localCanvas.setCursor(LOCAL_X, LOCAL_HUM_Y);
     localCanvas.printf("HUM: %.0f%%", g_humidity);
@@ -532,25 +949,20 @@ void updateSensorDisplay() {
     tft->draw16bitRGBBitmap(0, 5, localCanvas.getBuffer(), 200, 45);
   }
 
-  // Air quality — bottom of screen
-  // CO2 from SCD40 shows as soon as data arrives
-  // VOC and NOx from SGP41 wait for warmup
+  // Air quality — bottom
   if (hasSCD40Data) {
     aqCanvas.fillScreen(TFT_BLACK);
     aqCanvas.setFont(&FreeMono9pt7b);
 
-    // CO2 — color changes based on level
     aqCanvas.setTextColor(getCO2Color(col));
-    aqCanvas.setCursor(AQ_CO2_X - 30, 15);
+    aqCanvas.setCursor(AQ_CO2_X - 30, 17);
     aqCanvas.printf("CO2:%dppm", g_co2);
 
-    // VOC and NOx — only show after SGP41 warmup
     if (hasSGP41Data) {
       aqCanvas.setTextColor(col.date);
-      aqCanvas.setCursor(AQ_VOC_X - 30, 15);
+      aqCanvas.setCursor(AQ_VOC_X - 30, 17);
       aqCanvas.printf("VOC:%d", g_voc);
-
-      aqCanvas.setCursor(AQ_NOX_X - 30, 15);
+      aqCanvas.setCursor(AQ_NOX_X - 30, 17);
       aqCanvas.printf("NOx:%d", g_nox);
     }
 
@@ -569,19 +981,7 @@ void drawWiFiIcon(int x, int y) {
   }
 }
 
-void drawDynamicBorder(float temp) { // border color reflects outside temperature
-  uint16_t borderColor;
-  if      (temp >= 85) borderColor = TFT_RED;
-  else if (temp >= 70) borderColor = TFT_ORANGE;
-  else if (temp >= 55) borderColor = TFT_GREEN;
-  else if (temp >= 40) borderColor = 0x07FF; // cyan
-  else                 borderColor = TFT_BLUE;
-
-  tft->drawRect(0, 0, 320, 240, borderColor);
-  tft->drawRect(1, 1, 318, 238, borderColor); // double up for a bolder look
-}
-
-void runKITTScanner(int x) { // animated loading bar during WiFi connect
+void runKITTScanner(int x) {
   int y     = 310, h = 4;
   int tailX = max(0, x - 15);
   tft->fillRect(0,     y, 480, h, TFT_BLACK);
@@ -590,191 +990,20 @@ void runKITTScanner(int x) { // animated loading bar during WiFi connect
 }
 
 // =============================================================================
-// SETTINGS MENU
+// SYSTEM
 // =============================================================================
 
-// Opens the menu and draws it from the top
-void openMenu() {
-  menuOpen           = true;
-  menuIndex          = 0;
-  menuOffset         = 0;
-  brightnessSelected = false;
-  drawMenu();
-}
-
-// Closes the menu and redraws the full dashboard
-void closeMenu() {
-  menuOpen           = false;
-  brightnessSelected = false;
-  tft->fillScreen(TFT_BLACK);
-  lastMin = -1;
-  lastSec = -1; // force a full dashboard redraw
-  updateTimeDisplay();
-  updateWeatherDisplay();
-  updateSensorDisplay();
-  drawWiFiIcon(WIFI_ICON_X, WIFI_ICON_Y);
-}
-
-// Short press moves the highlight to the next item
-// If in brightness adjust mode, short press cycles brightness instead
-void navigateMenu() {
-  if (brightnessSelected) {
-    brightness = (brightness + 1) % BRIGHTNESS_COUNT; // cycle through brightness steps
-    // applyBrightness(); // uncomment when PFET is wired
-    drawMenu();
-    return;
-  }
-  menuIndex = (menuIndex + 1) % 7;
-  if (menuIndex >= menuOffset + 5) menuOffset++; // 5 visible items on bigger screen
-  if (menuIndex == 0) menuOffset = 0;
-  drawMenu();
-}
-
-// Long press acts on whatever is currently highlighted
-void selectMenuItem() {
-  switch (menuIndex) {
-    case 0: // Night Mode
-      isNightMode = !isNightMode;
-      saveSettings();
-      drawMenu();
-      break;
-
-    case 1: // Temp Unit
-      isCelsius = !isCelsius;
-      saveSettings();
-      drawMenu();
-      break;
-
-    case 2: // Military Time
-      isMilitaryTime = !isMilitaryTime;
-      saveSettings();
-      drawMenu();
-      break;
-
-    case 3: // Brightness — long press enters/exits adjust mode
-      brightnessSelected = !brightnessSelected;
-      if (!brightnessSelected) saveSettings(); // save when exiting adjust mode
-      drawMenu();
-      break;
-
-    case 4: // Auto Dim
-      isAutoDim = !isAutoDim;
-      // applyBrightness(); // uncomment when PFET is wired
-      saveSettings();
-      drawMenu();
-      break;
-
-    case 5: // Reset WiFi — show confirmation before doing anything
-      awaitingResetConfirm = true;
-      tft->fillScreen(TFT_BLACK);
-      tft->drawRoundRect(40, 100, 400, 120, 8, TFT_RED);
-      tft->setFont(&FreeSans9pt7b);
-      tft->setTextColor(TFT_WHITE);
-      tft->setCursor(100, 140);
-      tft->print("Reset WiFi credentials?");
-      tft->setTextColor(TFT_LIGHTGREY);
-      tft->setCursor(130, 165);
-      tft->print("Hold to confirm.");
-      tft->setCursor(130, 188);
-      tft->print("Tap to cancel.");
-      break;
-
-    case 6: closeMenu(); break;
-  }
-}
-
-// Draws the scrollbar — thumb moves down as you scroll through items
-void drawScrollbar() {
-  const int itemCount = 7;
-  const int visible   = 5;
-  const int trackX    = 450;
-  const int trackY    = 68;
-  const int trackH    = 210;
-
-  int thumbH = (visible * trackH) / itemCount; // thumb height proportional to visible ratio
-  int thumbY = trackY + (menuOffset * trackH) / itemCount; // moves down as menuOffset increases
-
-  tft->fillRect(trackX, trackY, 4, trackH, 0x2104);       // dim grey track
-  tft->fillRect(trackX, thumbY, 4, thumbH, TFT_CYAN); // cyan thumb
-}
-
-// Draws the full menu with the current item highlighted
-void drawMenu() {
-  const char* items[] = {
-    "Night Mode", "Temp Unit", "Military Time",
-    "Brightness", "Auto Dim", "Reset WiFi", "Close"
-  };
-  const int itemCount = 7;
-  const int visible   = 5;
-
-  tft->fillRoundRect(20, 40, 440, 240, 8, 0x1082);
-  tft->drawRoundRect(20, 40, 440, 240, 8, TFT_CYAN);
-
-  tft->setFont(&FreeSans9pt7b);
-  tft->setTextColor(TFT_CYAN);
-  tft->setCursor(190, 65);
-  tft->print("SETTINGS");
-  tft->drawFastHLine(30, 75, 420, TFT_CYAN);
-
-  for (int i = 0; i < visible; i++) {
-    int itemIdx = i + menuOffset;
-    if (itemIdx >= itemCount) break;
-    int itemY = 105 + (i * 35);
-
-    bool isBrightnessAdjusting = (itemIdx == 3 && brightnessSelected);
-
-    if (itemIdx == menuIndex) {
-      uint16_t hlColor = isBrightnessAdjusting ? TFT_YELLOW : TFT_CYAN;
-      tft->fillRoundRect(30, itemY - 16, 410, 26, 4, hlColor);
-      tft->setTextColor(TFT_BLACK);
-    } else {
-      tft->setTextColor(TFT_WHITE);
-    }
-
-    tft->setCursor(50, itemY);
-    tft->print(items[itemIdx]);
-
-    tft->setCursor(340, itemY);
-    if (itemIdx == 0) tft->print(isNightMode    ? "ON"  : "OFF");
-    if (itemIdx == 1) tft->print(isCelsius      ? "C"   : "F");
-    if (itemIdx == 2) tft->print(isMilitaryTime ? "ON"  : "OFF");
-    if (itemIdx == 3) {
-      int pct = map(BRIGHTNESS_STEPS[brightness], 191, 0, 25, 100);
-      tft->printf("%d%%", pct);
-    }
-    if (itemIdx == 4) tft->print(isAutoDim ? "ON" : "OFF");
-  }
-
-  drawScrollbar();
-
-  // hint text when in brightness adjust mode
-  if (brightnessSelected) {
-    tft->setFont(NULL);
-    tft->setTextColor(TFT_YELLOW);
-    tft->setCursor(100, 277);
-    tft->print("Tap to adjust, hold to confirm");
-  }
-}
-
-// =============================================================================
-// SYSTEM / HARDWARE
-// =============================================================================
-
-// Single place that applies brightness to the backlight.
-// In auto dim mode it maps g_lux to PWM. In manual mode it uses the saved step.
-// NOTE: When PFET is wired, uncomment the applyBrightness() calls in loop() and selectMenuItem()
 void applyBrightness() {
-  if (isAutoDim && g_lux > 0) {
-    int autoPwm = map(constrain((int)g_lux, 0, LUX_MAX), 0, LUX_MAX, AUTO_DIM_MIN, AUTO_DIM_MAX);
-    ledcWrite(TFT_PWM, autoPwm);
+  if (isAutoDim) {
+    int pwm = map(constrain((int)g_lux, 0, LUX_MAX), 0, LUX_MAX, AUTO_DIM_MIN, AUTO_DIM_MAX);
+    ledcWrite(TFT_PWM, pwm);
   } else {
     ledcWrite(TFT_PWM, BRIGHTNESS_STEPS[brightness]);
   }
 }
 
-// Loads all settings from NVS — called once at startup before anything draws
 void loadSettings() {
-  prefs.begin("settings", true); // read only
+  prefs.begin("settings", true);
   isNightMode    = prefs.getBool("nightMode",    false);
   isCelsius      = prefs.getBool("celsius",      false);
   isMilitaryTime = prefs.getBool("militaryTime", false);
@@ -784,7 +1013,6 @@ void loadSettings() {
   Serial.println("[NVS] Settings loaded");
 }
 
-// Saves all settings to NVS — called whenever a setting changes
 void saveSettings() {
   prefs.begin("settings", false);
   prefs.putBool("nightMode",    isNightMode);
@@ -796,58 +1024,15 @@ void saveSettings() {
   Serial.println("[NVS] Settings saved");
 }
 
-// Detects short vs long press and routes to the right handler
-void checkUserButton() {
-  static bool lastButtonState     = HIGH;
-  static unsigned long pressStart = 0;
-  bool currentButtonState = digitalRead(RESET_PIN);
-
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
-    pressStart = millis(); // button down — start the clock
-  }
-
-  if (lastButtonState == LOW && currentButtonState == HIGH) {
-    unsigned long holdTime = millis() - pressStart;
-    if (holdTime < 500) onShortPress(); // quick tap
-    else                onLongPress();  // held
-  }
-
-  lastButtonState = currentButtonState;
-}
-
-// Short press — opens menu, navigates items, or cancels a reset confirmation
-void onShortPress() {
-  if (awaitingResetConfirm) {
-    awaitingResetConfirm = false; // tap cancels the reset
-    drawMenu();
-    return;
-  }
-  if (!menuOpen) openMenu();
-  else           navigateMenu();
-}
-
-// Long press — selects a menu item or confirms a WiFi reset
-void onLongPress() {
-  if (awaitingResetConfirm) {
-    awaitingResetConfirm = false;
-    prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
-    WiFiManager wm; wm.resetSettings();
-    WiFi.disconnect(true, true);
-    delay(2000);
-    ESP.restart();
-  }
-  if (menuOpen) selectMenuItem();
-}
-
 void checkWiFiHealth() {
   static unsigned long disconnectTime     = 0;
   static unsigned long lastRetry          = 0;
-  static unsigned long lastSuccessfulSync = millis(); // start at now so first reconnect behaves correctly
+  static unsigned long lastSuccessfulSync = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
     if (disconnectTime == 0) disconnectTime = millis();
 
-    if (millis() - lastRetry > 60000) { // try to reconnect every 60s
+    if (millis() - lastRetry > 60000) {
       lastRetry = millis();
       prefs.begin("wifi-gate", false);
       String vSSID = prefs.getString("ssid", "");
@@ -856,12 +1041,10 @@ void checkWiFiHealth() {
       if (vSSID != "") WiFi.begin(vSSID.c_str(), vPASS.c_str());
     }
 
-    if (millis() - disconnectTime > 21600000) ESP.restart(); // 6hrs no connection — restart
+    if (millis() - disconnectTime > 21600000) ESP.restart();
 
   } else {
     if (disconnectTime != 0) {
-      // just reconnected — only resync if it's been more than 60s since last sync
-      // stops it hammering NTP every time the signal blips in and out
       if (millis() - lastSuccessfulSync > 60000) {
         syncLocationAndTime();
         lastSuccessfulSync = millis();
@@ -877,56 +1060,12 @@ void checkDaylightSavings() {
   if (!getLocalTime(&ti)) return;
 
   if (ti.tm_hour == 2 && ti.tm_min == 1) {
-    if (!syncedThisMinute && WiFi.status() == WL_CONNECTED) { // fires once at 2:01 AM
+    if (!syncedThisMinute && WiFi.status() == WL_CONNECTED) {
       if (syncLocationAndTime()) lastWeatherTime = 0;
       syncedThisMinute = true;
     }
   } else {
-    syncedThisMinute = false; // reset so it works again next year
-  }
-}
-
-void handleDeepReset() {
-  pinMode(RESET_PIN, INPUT_PULLUP);
-  delay(100);
-  if (digitalRead(RESET_PIN) == LOW) {
-    unsigned long startHold = millis();
-    tft->fillScreen(TFT_MAROON);
-    tft->setFont(&FreeSans9pt7b);
-    tft->setTextColor(TFT_WHITE);
-    tft->setCursor(80, 140);
-    tft->print("KEEP HOLDING TO RESET");
-
-    while (digitalRead(RESET_PIN) == LOW) {
-      int barWidth  = map(millis() - startHold, 0, 5000, 0, 240);
-      int remaining = 5 - (int)((millis() - startHold) / 1000);
-
-      tft->fillRect(60, 160, barWidth, 10, TFT_YELLOW);
-      tft->fillRect(210, 180, 60, 40, TFT_MAROON);
-      tft->setCursor(220, 210);
-      tft->setFont(&FreeSansBold18pt7b);
-      tft->setTextColor(TFT_WHITE);
-      tft->printf("%d", remaining);
-
-      if (millis() - startHold > 5000) { // held long enough — wipe and restart clean
-        prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
-        prefs.begin("settings",  false); prefs.clear(); prefs.end(); // wipe settings too
-        WiFiManager wm; wm.resetSettings();
-        WiFi.disconnect(true, true);
-        delay(2000);
-        ESP.restart();
-      }
-      delay(100);
-    }
-
-    // released before 5s — nothing happens
-    tft->fillScreen(TFT_BLACK);
-    tft->setFont(&FreeSans9pt7b);
-    tft->setTextColor(TFT_GREEN);
-    tft->setCursor(150, 160);
-    tft->print("Reset cancelled.");
-    delay(1000);
-    showSplashScreen();
+    syncedThisMinute = false;
   }
 }
 
@@ -934,7 +1073,6 @@ void handleDeepReset() {
 // WIFI MANAGEMENT
 // =============================================================================
 
-// Checks for saved credentials — connects if found, launches setup portal if not
 void manageWiFiVault() {
   prefs.begin("wifi-gate", false);
   String vSSID = prefs.getString("ssid", "");
@@ -945,7 +1083,6 @@ void manageWiFiVault() {
   else             connectToWiFi(vSSID, vPASS);
 }
 
-// Shows the connect screen and waits for WiFi — runs the KITT scanner while it waits
 void connectToWiFi(String vSSID, String vPASS) {
   tft->fillScreen(TFT_BLACK);
   tft->setFont(&FreeMono9pt7b);
@@ -963,26 +1100,43 @@ void connectToWiFi(String vSSID, String vPASS) {
   tft->setTextColor(TFT_MAGENTA);
   tft->print(vSSID);
 
+  // hint visible from the start so user knows the escape hatch exists
+  tft->setFont(NULL);
+  tft->setTextColor(0x4208); // dim grey
+  tft->setCursor(60, 290);
+  tft->print("Hold screen 3s to reset WiFi");
+
   WiFi.begin(vSSID.c_str(), vPASS.c_str());
 
-  int scannerX  = 0;
-  int direction = 6;
-  unsigned long lastRetry = millis();
+  int scannerX       = 0;
+  int direction      = 6;
+  unsigned long lastRetry      = millis();
+  unsigned long touchHoldStart = 0;
 
   while (WiFi.status() != WL_CONNECTED) {
     scannerX += direction;
-    if (scannerX >= 310) direction = -6; // force direction — stops it running off the edge
+    if (scannerX >= 470) direction = -6;
     if (scannerX <= 0)   direction =  6;
     runKITTScanner(scannerX);
+
+    // hold screen for 3 seconds to trigger WiFi reset
+    if (touch.touched()) {
+      if (touchHoldStart == 0) touchHoldStart = millis();
+      if (millis() - touchHoldStart > 3000) {
+        prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
+        WiFiManager wm; wm.resetSettings();
+        WiFi.disconnect(true, true);
+        delay(500);
+        launchSetupPortal();
+        return;
+      }
+    } else {
+      touchHoldStart = 0; // finger lifted — reset timer
+    }
 
     if (millis() - lastRetry > 20000) {
       WiFi.begin(vSSID.c_str(), vPASS.c_str());
       lastRetry = millis();
-      tft->fillRect(15, 268, 450, 30, TFT_BLACK);
-      tft->setFont(NULL);
-      tft->setTextColor(TFT_YELLOW);
-      tft->setCursor(20, 270);
-      tft->print("Taking long? Hold button while plugging in to reset WiFi.");
     }
     delay(20);
   }
@@ -999,7 +1153,6 @@ void connectToWiFi(String vSSID, String vPASS) {
   tft->drawFastHLine(60, DIVIDER_Y, 320, TFT_DARKGREY);
 }
 
-// No saved credentials — launches a captive portal so the user can enter WiFi details
 void launchSetupPortal() {
   showSetupScreen("OmniCore-Setup");
   WiFiManager wm;
@@ -1019,25 +1172,25 @@ void launchSetupPortal() {
 }
 
 // =============================================================================
-// DATA LAYER — fetches data and writes to shared globals, never touches the screen
+// DATA LAYER
 // =============================================================================
 
 bool fetchWeather() {
   HTTPClient http;
-  http.setTimeout(5000);        // 5s response timeout
-  http.setConnectTimeout(3000); // 3s connection timeout
+  http.setTimeout(5000);
+  http.setConnectTimeout(3000);
   String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + currentCity
                + "&appid=" + String(weatherKey) + "&units=imperial";
   bool success = false;
   if (http.begin(url)) {
     if (http.GET() == 200) {
       JsonDocument doc;
-      deserializeJson(doc, http.getStream()); // stream directly — saves RAM
+      deserializeJson(doc, http.getStream());
       g_currentTemp = doc["list"][0]["main"]["temp"];
       g_skyStatus   = doc["list"][0]["weather"][0]["main"].as<String>();
       g_tempHigh = -100.0;
       g_tempLow  =  200.0;
-      for (int i = 0; i < FORECAST_PERIODS_24H; i++) { // find true high/low over 24hrs
+      for (int i = 0; i < FORECAST_PERIODS_24H; i++) {
         float h = doc["list"][i]["main"]["temp_max"];
         float l = doc["list"][i]["main"]["temp_min"];
         if (h > g_tempHigh) g_tempHigh = h;
@@ -1051,7 +1204,7 @@ bool fetchWeather() {
   return success;
 }
 
-bool syncLocationAndTime() { // loop() checks WiFi before calling this
+bool syncLocationAndTime() {
   HTTPClient http;
   http.setTimeout(5000);
   http.setConnectTimeout(3000);
@@ -1072,21 +1225,19 @@ bool syncLocationAndTime() { // loop() checks WiFi before calling this
   return success;
 }
 
-// Reads TSL2591, SCD40, and SGP41 — writes to g_ globals, never touches the display
 void updateLocalSensors() {
   // TSL2591 lux
   uint32_t lum  = tsl.getFullLuminosity();
   uint16_t ir   = lum >> 16;
   uint16_t full = lum & 0xFFFF;
   if (full == 0 && ir == 0) {
-    g_lux = 0; // too dark to measure — skip the calculation entirely
+    g_lux = 0;
   } else {
     float lux = tsl.calculateLux(full, ir);
-    g_lux = (isnan(lux) || lux < 0 || lux > 88000) ? 0 : lux; // reject invalid results
+    g_lux = (isnan(lux) || lux < 0 || lux > 88000) ? 0 : lux;
   }
 
-  // SCD40 — CO2, temperature, humidity
-  // getDataReadyStatus only returns true when a new measurement is available
+  // SCD40
   uint16_t co2;
   float    temp, hum;
   bool     dataReady = false;
@@ -1095,14 +1246,13 @@ void updateLocalSensors() {
     uint16_t error = scd4x.readMeasurement(co2, temp, hum);
     if (!error && co2 != 0) {
       g_co2        = co2;
-      g_localTemp  = temp * 9.0 / 5.0 + 32.0; // store as Fahrenheit
+      g_localTemp  = temp * 9.0 / 5.0 + 32.0;
       g_humidity   = hum;
       hasSCD40Data = true;
     }
   }
 
-  // SGP41 — VOC index and NOx index
-  // feed SCD40 temp and humidity into compensation algorithm for accurate readings
+  // SGP41
   uint16_t srawVoc = 0, srawNox = 0;
   uint16_t rhComp  = hasSCD40Data ? (uint16_t)(g_humidity * 65535.0 / 100.0) : 0x8000;
   uint16_t tComp   = hasSCD40Data ? (uint16_t)(((g_localTemp - 32.0) * 5.0 / 9.0 + 45.0) * 65535.0 / 175.0) : 0x6666;
