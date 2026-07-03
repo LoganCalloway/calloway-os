@@ -216,6 +216,8 @@ bool          touchActive    = false;
 int           touchStartX    = 0;
 int           touchStartY    = 0;
 unsigned long touchStartTime = 0;
+unsigned long lastTapTime   = 0;
+unsigned long lastTouchPoll = 0;
 
 // Weather globals — written by fetchWeather(), read by updateWeatherDisplay()
 float  g_currentTemp = 0;
@@ -453,17 +455,22 @@ void mapTouch(TS_Point p, int &x, int &y) {
 }
 
 void checkTouch() {
+  // limit touch polling to 50Hz — reduces I2C bus contention with sensors
+  unsigned long now = millis();
+  if (now - lastTouchPoll < 20) return;
+  lastTouchPoll = now;
+
   if (!touch.touched()) {
     if (touchActive) {
       touchActive = false;
       unsigned long holdTime = millis() - touchStartTime;
 
-      // process as tap if touch was short — filters out long holds and drags
-      if (holdTime < 500) {
+      // process as tap if short touch and not too soon after last tap
+      if (holdTime > 10 && holdTime < 500 && millis() - lastTapTime > 400) {
+        lastTapTime = millis();
         if (awaitingResetConfirm) {
           handleResetConfirmTouch(touchStartX, touchStartY);
         } else if (brightnessSliderOpen) {
-          // tap outside slider area saves and returns to menu
           if (touchStartY < SLIDER_Y - 40 || touchStartY > SLIDER_Y + 60) {
             brightnessSliderOpen = false;
             saveSettings();
@@ -472,7 +479,7 @@ void checkTouch() {
         } else if (menuOpen) {
           handleMenuTouch(touchStartX, touchStartY);
         } else {
-          openMenu(); // tap anywhere on dashboard opens menu
+          openMenu();
         }
       }
     }
@@ -490,7 +497,6 @@ void checkTouch() {
     touchStartTime = millis();
   }
 
-  // live slider drag while finger is down
   if (brightnessSliderOpen) {
     handleSliderTouch(x, y);
   }
