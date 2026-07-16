@@ -10,7 +10,7 @@
 //  Product      : Omni-Core Telemetry Station
 //  Platform     : XIAO ESP32-C6
 //  Display      : ST7796 3.5" IPS TFT (480x320) with FT6236 capacitive touch
-//  Version      : v1.9
+//  Version      : v2.0
 //  Author       : Logan Calloway
 //  License      : Copyright (c) 2025 Logan Calloway. All Rights Reserved.
 //                 Unauthorized copying, distribution, or modification of
@@ -19,8 +19,8 @@
 //  Description  :
 //    A desktop engineering dashboard built on the XIAO ESP32-C6. Pulls time
 //    from NTP, weather from OpenWeatherMap, and reads live environmental data
-//    from the TSL2591 (light), SCD40 (CO2, temp, humidity), and SGP41
-//    (VOC index, NOx index). Full capacitive touch menu via FT6236. Settings
+//    from the TSL2591 (light), SCD40 (CO2, temp, humidity), and SEN54
+//    (PM1/PM2.5/PM4/PM10 + VOC index). Full capacitive touch menu via FT6236. Settings
 //    persist across reboots via NVS. Backlight driven by direct PWM to the
 //    display LED pin. Auto Dim maps TSL2591 lux to brightness automatically.
 // -----------------------------------------------------------------------------
@@ -43,14 +43,14 @@
 #include <WiFi.h>
 #include <time.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <Adafruit_FT6206.h>
 #include <Adafruit_TSL2591.h>
 #include <SensirionI2cScd4x.h>
-#include <SensirionI2CSgp41.h>
-#include <VOCGasIndexAlgorithm.h>
-#include <NOxGasIndexAlgorithm.h>
+#include <SensirionI2CSen5x.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
@@ -80,7 +80,7 @@
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
-#define OS_VERSION    "CALLOWAY_OS v1.9"
+#define OS_VERSION    "CALLOWAY_OS v2.0"
 const char* weatherKey  = WEATHER_API_KEY;
 String currentCity      = "Asheville,US";   // updated by syncLocationAndTime()
 long   currentUtcOffset = -14400;           // updated by syncLocationAndTime()
@@ -121,18 +121,26 @@ long   currentUtcOffset = -14400;           // updated by syncLocationAndTime()
 #define LUX_BAR_X       15
 #define LUX_BAR_Y      210
 #define LUX_BAR_WIDTH   14
-#define LUX_BAR_HEIGHT  90
+#define LUX_BAR_HEIGHT  75
 #define LUX_MAX        150  // tune to match your room lighting
 
 // Local sensor readings — top left (SCD40 temp and humidity)
 #define LOCAL_X         5
 #define LOCAL_TEMP_Y    20
-#define LOCAL_HUM_Y     38
+#define LOCAL_HUM_Y     44
 
-// Air quality row — bottom of screen
-#define AQ_CO2_X        10
-#define AQ_VOC_X       160
-#define AQ_NOX_X       300
+// Particulate row — sits directly above the air quality row
+// X values are canvas-local (canvas is pushed to screen at x=30)
+#define PM_ROW_Y       262   // screen Y where the PM canvas is pushed
+#define PM1_X            8
+#define PM25_X         108
+#define PM4_X          228
+#define PM10_X         330
+
+// Air quality row — bottom of screen (CO2 + VOC)
+#define AQ_ROW_Y       292   // screen Y where the AQ canvas is pushed
+#define AQ_CO2_X         8
+#define AQ_VOC_X       200
 
 // Menu geometry
 #define MENU_X          20
@@ -183,16 +191,16 @@ Arduino_GFX      *tft = new Arduino_ST7796(bus, TFT_RST, 3); // rotation 3 = lan
 Adafruit_FT6206   touch;
 Adafruit_TSL2591  tsl = Adafruit_TSL2591(2591);
 SensirionI2cScd4x scd4x;
-SensirionI2CSgp41 sgp41;
-VOCGasIndexAlgorithm vocAlgorithm;
-NOxGasIndexAlgorithm noxAlgorithm;
+SensirionI2CSen5x sen5x;   // PM1/2.5/4/10 + VOC index, I2C addr 0x69
 Preferences       prefs;
+WebServer         server(80);   // dashboard is served at omnicore.local
 
 // Off-screen canvases — draw here then push to screen in one shot to prevent flicker
 GFXcanvas16 clockCanvas(420, 65);   // large — holds 24pt clock digits
-GFXcanvas16 localCanvas(200, 45);   // top left — SCD40 temp and humidity
-GFXcanvas16 aqCanvas(440, 22);      // bottom — CO2, VOC, NOx
-GFXcanvas16 dateCanvas(320, 22);    // date line — only redraws on minute change
+GFXcanvas16 localCanvas(220, 55);   // top left — SCD40 temp and humidity
+GFXcanvas16 pmCanvas(440, 24);      // particulates — PM1, PM2.5, PM4, PM10
+GFXcanvas16 aqCanvas(440, 24);      // bottom — CO2 and VOC index
+GFXcanvas16 dateCanvas(320, 24);    // date line — only redraws on minute change
 
 // =============================================================================
 // STATE
@@ -201,7 +209,7 @@ int  lastMin = -1, lastSec = -1;    // dirty bits — only redraw when changed
 bool isNightMode          = false;
 bool hasWeatherData       = false;   // gates weather display until first fetch
 bool hasSCD40Data         = false;   // gates sensor display until first read
-bool hasSGP41Data         = false;   // gates VOC/NOx display until warmup
+bool hasSEN54Data         = false;   // gates PM/VOC display until first valid read
 bool isCelsius            = false;
 bool isMilitaryTime       = false;
 bool isAutoDim            = false;
@@ -226,12 +234,15 @@ float  g_tempLow     = 0;
 String g_skyStatus   = "";
 
 // Sensor globals — written by updateLocalSensors(), read by updateSensorDisplay()
-float    g_lux      = 0;
-float    g_localTemp = 0;  // stored as Fahrenheit, converted on display
-float    g_humidity  = 0;
-uint16_t g_co2       = 0;
-int32_t  g_voc       = 0;
-int32_t  g_nox       = 0;
+float    g_lux       = 0;
+float    g_localTemp = 0;  // SCD40, stored as Fahrenheit, converted on display
+float    g_humidity  = 0;  // SCD40
+uint16_t g_co2       = 0;  // SCD40, ppm
+float    g_pm1       = 0;  // SEN54, ug/m3
+float    g_pm25      = 0;  // SEN54, ug/m3
+float    g_pm4       = 0;  // SEN54, ug/m3
+float    g_pm10      = 0;  // SEN54, ug/m3
+float    g_voc       = 0;  // SEN54, index 0-500 (100 = your baseline)
 
 // =============================================================================
 // COLOR PALETTE — single source of truth for day and night mode colors
@@ -252,12 +263,16 @@ struct ColorPalette {
   uint16_t co2Good;   // < 800 ppm
   uint16_t co2Warn;   // 800–1200 ppm
   uint16_t co2High;   // > 1200 ppm
+  uint16_t pm25Good;  // < 12 ug/m3
+  uint16_t pm25Warn;  // 12–35 ug/m3
+  uint16_t pm25High;  // > 35 ug/m3
 };
 
 ColorPalette getColorPalette() {
   if (isNightMode) {
     return { 0xF800, 0x8000, 0xA000, 0x4000, 0x8000, 0xFBE0, 0xF800, 0x0410,
              0x8000, 0x2104, 0x0400, 0x4000,
+             0x4000, 0x8400, 0x8000,
              0x4000, 0x8400, 0x8000 };
   } else {
     return {
@@ -265,6 +280,7 @@ ColorPalette getColorPalette() {
       TFT_DARKGREY, TFT_LIGHTGREY, TFT_ORANGE,
       TFT_RED, TFT_CYAN,
       TFT_YELLOW, 0x2104, TFT_GREEN, TFT_RED,
+      TFT_GREEN, TFT_YELLOW, TFT_RED,
       TFT_GREEN, TFT_YELLOW, TFT_RED
     };
   }
@@ -274,6 +290,13 @@ uint16_t getCO2Color(ColorPalette col) {
   if (g_co2 < 800)  return col.co2Good;
   if (g_co2 < 1200) return col.co2Warn;
   return col.co2High;
+}
+
+// PM2.5 is the health-relevant particulate number — EPA breakpoints in ug/m3
+uint16_t getPM25Color(ColorPalette col) {
+  if (g_pm25 < 12.0) return col.pm25Good;
+  if (g_pm25 < 35.0) return col.pm25Warn;
+  return col.pm25High;
 }
 
 // =============================================================================
@@ -308,6 +331,9 @@ void updateWeatherDisplay();
 void updateSensorDisplay();
 void drawWiFiIcon(int x, int y);
 void runKITTScanner(int x);
+void handleRoot();
+void handleData();
+void startWebServer();
 
 // =============================================================================
 // SETUP
@@ -327,7 +353,7 @@ void setup() {
 
   showSplashScreen();
 
-  // I2C bus — shared by TSL2591, SCD40, SGP41, and FT6236
+  // I2C bus — shared by TSL2591, SCD40, SEN54, and FT6236
   Wire.begin(TFT_SDA, TFT_SCL);
   Wire.setClock(400000); // 400kHz fast mode — reduces I2C transaction time
 
@@ -370,16 +396,19 @@ void setup() {
   if (scd40Error) Serial.println("[SCD40] Init failed");
   else            Serial.println("[SCD40] Started");
 
-  // SGP41 — conditioning run uses default temp/humidity until SCD40 data arrives
-  sgp41.begin(Wire);
-  uint16_t defaultRh = 0x8000; // 50% RH default
-  uint16_t defaultT  = 0x6666; // 25C default
-  uint16_t cond_s    = 0;
-  sgp41.executeConditioning(defaultRh, defaultT, cond_s);
-  Serial.println("[SGP41] Started");
+  // SEN54 — particulates + VOC index. Runs its own VOC algorithm internally,
+  // so no external gas index library is needed. Fan spins up on startMeasurement().
+  // PM readings take ~30s to settle after the fan starts.
+  sen5x.begin(Wire);
+  sen5x.deviceReset();
+  delay(100);
+  uint16_t sen54Error = sen5x.startMeasurement();
+  if (sen54Error) Serial.println("[SEN54] Init failed");
+  else            Serial.println("[SEN54] Started — fan spinning up");
 
   manageWiFiVault();
   syncLocationAndTime();
+  startWebServer();
 
   tft->fillScreen(TFT_BLACK);
 
@@ -402,6 +431,7 @@ void loop() {
   unsigned long currentMillis = millis();
 
   checkTouch(); // every loop — touch must feel instant
+  server.handleClient();
 
   if (currentMillis - lastClockTime >= clockInterval) {
     checkWiFiHealth();
@@ -817,7 +847,7 @@ void updateTimeDisplay() {
       dateCanvas.setCursor(DATE_X - 60, 17);
       dateCanvas.print(dateBuf);
 
-      tft->draw16bitRGBBitmap(60, 158, dateCanvas.getBuffer(), 320, 22);
+      tft->draw16bitRGBBitmap(60, 156, dateCanvas.getBuffer(), 320, 24);
       tft->drawFastHLine(60, DIVIDER_Y, 320, col.line);
       lastMin = timeinfo.tm_min;
     }
@@ -856,7 +886,7 @@ void updateWeatherDisplay() {
   const char* unit  = isCelsius ? "C" : "F";
 
   tft->fillRect(280, 5, 195, 80, TFT_BLACK);
-  tft->setFont(&FreeMono9pt7b);
+  tft->setFont(&FreeSans9pt7b);
 
   tft->setTextColor(col.city);
   tft->setCursor(WEATHER_X, WEATHER_CITY_Y);
@@ -889,7 +919,7 @@ void updateSensorDisplay() {
     const char* unit = isCelsius ? "C" : "F";
 
     localCanvas.fillScreen(TFT_BLACK);
-    localCanvas.setFont(&FreeMono9pt7b);
+    localCanvas.setFont(&FreeSans9pt7b);
     localCanvas.setTextColor(col.temp);
     localCanvas.setCursor(LOCAL_X, LOCAL_TEMP_Y);
     localCanvas.printf("%.1f%s", displayLocalTemp, unit);
@@ -897,27 +927,52 @@ void updateSensorDisplay() {
     localCanvas.setCursor(LOCAL_X, LOCAL_HUM_Y);
     localCanvas.printf("HUM: %.0f%%", g_humidity);
 
-    tft->draw16bitRGBBitmap(0, 5, localCanvas.getBuffer(), 200, 45);
+    tft->draw16bitRGBBitmap(0, 5, localCanvas.getBuffer(), 220, 55);
   }
 
-  // Air quality row — bottom of screen, CO2 always shows, VOC/NOx wait for warmup
-  if (hasSCD40Data) {
+  // Particulate row — PM1 / PM2.5 / PM4 / PM10 from the SEN54.
+  // PM2.5 is color coded since it is the health-relevant number.
+  if (hasSEN54Data) {
+    pmCanvas.fillScreen(TFT_BLACK);
+    pmCanvas.setFont(&FreeSans9pt7b);
+
+    pmCanvas.setTextColor(col.date);
+    pmCanvas.setCursor(PM1_X, 17);
+    pmCanvas.printf("PM1:%.1f", g_pm1);
+
+    pmCanvas.setTextColor(getPM25Color(col)); // the one that matters
+    pmCanvas.setCursor(PM25_X, 17);
+    pmCanvas.printf("PM2.5:%.1f", g_pm25);
+
+    pmCanvas.setTextColor(col.date);
+    pmCanvas.setCursor(PM4_X, 17);
+    pmCanvas.printf("PM4:%.1f", g_pm4);
+
+    pmCanvas.setCursor(PM10_X, 17);
+    pmCanvas.printf("PM10:%.1f", g_pm10);
+
+    tft->draw16bitRGBBitmap(30, PM_ROW_Y, pmCanvas.getBuffer(), 440, 24);
+  }
+
+  // Air quality row — CO2 from SCD40, VOC index from SEN54.
+  // Each is gated on its own sensor so one can appear before the other.
+  if (hasSCD40Data || hasSEN54Data) {
     aqCanvas.fillScreen(TFT_BLACK);
-    aqCanvas.setFont(&FreeMono9pt7b);
+    aqCanvas.setFont(&FreeSans9pt7b);
 
-    aqCanvas.setTextColor(getCO2Color(col));
-    aqCanvas.setCursor(AQ_CO2_X, 17);
-    aqCanvas.printf("CO2:%dppm", g_co2);
-
-    if (hasSGP41Data) {
-      aqCanvas.setTextColor(col.date);
-      aqCanvas.setCursor(AQ_VOC_X, 17);
-      aqCanvas.printf("VOC:%d", g_voc);
-      aqCanvas.setCursor(AQ_NOX_X, 17);
-      aqCanvas.printf("NOx:%d", g_nox);
+    if (hasSCD40Data) {
+      aqCanvas.setTextColor(getCO2Color(col));
+      aqCanvas.setCursor(AQ_CO2_X, 17);
+      aqCanvas.printf("CO2:%dppm", g_co2);
     }
 
-    tft->draw16bitRGBBitmap(30, 296, aqCanvas.getBuffer(), 440, 22);
+    if (hasSEN54Data) {
+      aqCanvas.setTextColor(col.date);
+      aqCanvas.setCursor(AQ_VOC_X, 17);
+      aqCanvas.printf("VOC:%.0f", g_voc);
+    }
+
+    tft->draw16bitRGBBitmap(30, AQ_ROW_Y, aqCanvas.getBuffer(), 440, 24);
   }
 }
 
@@ -1120,6 +1175,111 @@ void launchSetupPortal() {
 }
 
 // =============================================================================
+// WEB SERVER — serves a live dashboard on the local network at omnicore.local
+// Reads the same g_ globals the display does. Never fetches, never draws.
+// =============================================================================
+
+// Page lives in flash, not RAM. JS polls /data every 2s and patches the DOM,
+// so the page never reloads and never flickers.
+static const char PAGE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Omni-Core</title>
+<style>
+  body{background:#050505;color:#0ff;font-family:'Courier New',monospace;
+       margin:0;padding:20px;}
+  h1{color:#0f0;text-align:center;letter-spacing:3px;margin:0 0 4px;font-size:1.4em;}
+  .sub{text-align:center;color:#055;font-size:.75em;margin-bottom:24px;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+        gap:12px;max-width:800px;margin:0 auto;}
+  .card{background:#0a0a0a;border:1px solid #044;padding:14px;text-align:center;}
+  .card:hover{border-color:#0ff;}
+  .lbl{font-size:.65em;color:#077;text-transform:uppercase;letter-spacing:2px;}
+  .val{font-size:1.7em;font-weight:bold;margin-top:6px;}
+  .unit{font-size:.5em;color:#066;margin-left:3px;}
+  .good{color:#0f0;} .warn{color:#ff0;} .bad{color:#f33;} .neut{color:#0ff;}
+  .foot{text-align:center;color:#044;font-size:.65em;margin-top:24px;}
+</style></head><body>
+<h1>OMNI-CORE</h1>
+<div class='sub' id='city'>&nbsp;</div>
+<div class='grid'>
+  <div class='card'><div class='lbl'>CO2</div>
+    <div class='val neut' id='co2'>--<span class='unit'>ppm</span></div></div>
+  <div class='card'><div class='lbl'>PM2.5</div>
+    <div class='val neut' id='pm25'>--<span class='unit'>ug/m3</span></div></div>
+  <div class='card'><div class='lbl'>VOC Index</div>
+    <div class='val neut' id='voc'>--</div></div>
+  <div class='card'><div class='lbl'>Temp</div>
+    <div class='val neut' id='temp'>--<span class='unit'>F</span></div></div>
+  <div class='card'><div class='lbl'>Humidity</div>
+    <div class='val neut' id='hum'>--<span class='unit'>%</span></div></div>
+  <div class='card'><div class='lbl'>Light</div>
+    <div class='val neut' id='lux'>--<span class='unit'>lux</span></div></div>
+  <div class='card'><div class='lbl'>PM1</div>
+    <div class='val neut' id='pm1'>--</div></div>
+  <div class='card'><div class='lbl'>PM4</div>
+    <div class='val neut' id='pm4'>--</div></div>
+  <div class='card'><div class='lbl'>PM10</div>
+    <div class='val neut' id='pm10'>--</div></div>
+</div>
+<div class='foot'>CALLOWAY OS &middot; live &middot; updates every 2s</div>
+<script>
+function cls(el,c){el.className='val '+c;}
+function tick(){
+  fetch('/data').then(r=>r.json()).then(d=>{
+    let co2=document.getElementById('co2');
+    co2.innerHTML=d.co2+"<span class='unit'>ppm</span>";
+    cls(co2, d.co2<800?'good':d.co2<1200?'warn':'bad');
+
+    let pm=document.getElementById('pm25');
+    pm.innerHTML=d.pm25.toFixed(1)+"<span class='unit'>ug/m3</span>";
+    cls(pm, d.pm25<12?'good':d.pm25<35?'warn':'bad');
+
+    document.getElementById('voc').textContent  = d.voc;
+    document.getElementById('pm1').textContent  = d.pm1.toFixed(1);
+    document.getElementById('pm4').textContent  = d.pm4.toFixed(1);
+    document.getElementById('pm10').textContent = d.pm10.toFixed(1);
+    document.getElementById('temp').innerHTML   = d.temp.toFixed(1)+"<span class='unit'>F</span>";
+    document.getElementById('hum').innerHTML    = d.hum.toFixed(0)+"<span class='unit'>%</span>";
+    document.getElementById('lux').innerHTML    = d.lux.toFixed(0)+"<span class='unit'>lux</span>";
+    document.getElementById('city').textContent = d.city;
+  }).catch(e=>{});
+}
+tick(); setInterval(tick,2000);
+</script></body></html>
+)HTML";
+
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_HTML);
+}
+
+// Raw JSON — this is the reusable part. Any future app, script, or cloud
+// integration can just read this endpoint.
+void handleData() {
+  char json[288];
+  snprintf(json, sizeof(json),
+    "{\"co2\":%u,\"pm1\":%.1f,\"pm25\":%.1f,\"pm4\":%.1f,\"pm10\":%.1f,"
+    "\"voc\":%.0f,\"temp\":%.1f,\"hum\":%.1f,\"lux\":%.1f,\"city\":\"%s\"}",
+    g_co2, g_pm1, g_pm25, g_pm4, g_pm10, g_voc,
+    g_localTemp, g_humidity, g_lux,
+    currentCity.substring(0, currentCity.indexOf(',')).c_str());
+  server.send(200, "application/json", json);
+}
+
+void startWebServer() {
+  if (MDNS.begin("omnicore")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("[WEB] mDNS started — http://omnicore.local");
+  }
+  server.on("/",     handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.printf("[WEB] Dashboard live at http://%s  or  http://omnicore.local\n",
+                WiFi.localIP().toString().c_str());
+}
+
+// =============================================================================
 // DATA LAYER — fetches data, writes to globals, never touches the screen
 // =============================================================================
 
@@ -1200,19 +1360,31 @@ void updateLocalSensors() {
     }
   }
 
-  // SGP41 — compensated by SCD40 temp and humidity for accurate readings
-  uint16_t srawVoc = 0, srawNox = 0;
-  uint16_t rhComp  = hasSCD40Data ? (uint16_t)(g_humidity * 65535.0 / 100.0) : 0x8000;
-  uint16_t tComp   = hasSCD40Data ? (uint16_t)(((g_localTemp - 32.0) * 5.0 / 9.0 + 45.0) * 65535.0 / 175.0) : 0x6666;
+  // SEN54 — particulates and VOC index.
+  // The module runs its own compensation and VOC algorithm internally, so we
+  // just read the finished values. It also reports its own temp/humidity, but
+  // we ignore those and keep the SCD40 as the single source of truth for both.
+  // SEN54 has no NOx sensor (that is the SEN55) so noxIndex comes back NaN.
+  float senPm1, senPm25, senPm4, senPm10;
+  float senHum, senTemp, senVoc, senNox;
 
-  if (sgp41.measureRawSignals(rhComp, tComp, srawVoc, srawNox) == 0) {
-    g_voc        = vocAlgorithm.process(srawVoc);
-    g_nox        = noxAlgorithm.process(srawNox);
-    hasSGP41Data = true;
+  if (sen5x.readMeasuredValues(senPm1, senPm25, senPm4, senPm10,
+                               senHum, senTemp, senVoc, senNox) == 0) {
+    // fan needs ~30s before PM values are meaningful — reject NaN until then
+    if (!isnan(senPm25) && !isnan(senVoc)) {
+      g_pm1        = senPm1;
+      g_pm25       = senPm25;
+      g_pm4        = senPm4;
+      g_pm10       = senPm10;
+      g_voc        = senVoc;
+      hasSEN54Data = true;
+    }
   }
 
-  Serial.printf("[LUX] %.1f  [CO2] %d ppm  [TEMP] %.1fF  [HUM] %.1f%%  [VOC] %d  [NOx] %d\n",
-                g_lux, g_co2, g_localTemp, g_humidity, g_voc, g_nox);
+  Serial.printf("[LUX] %.1f  [CO2] %d ppm  [TEMP] %.1fF  [HUM] %.1f%%  "
+                "[PM1] %.1f  [PM2.5] %.1f  [PM4] %.1f  [PM10] %.1f  [VOC] %.0f\n",
+                g_lux, g_co2, g_localTemp, g_humidity,
+                g_pm1, g_pm25, g_pm4, g_pm10, g_voc);
 }
 
 // =============================================================================
