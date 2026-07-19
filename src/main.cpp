@@ -76,11 +76,23 @@
 #define TFT_DARKGREY    0x7BEF
 #define TFT_LIGHTGREY   0xC618
 #define TFT_MAROON      0x7800
+#define TFT_DARKBG      0x2104  // shared dark neutral background — used in both day and night palettes
+
+// Night Mode red-shift palette — preserves night vision, avoids blue/white
+// light. Named because each shade is reused across several palette fields
+// below; a couple of genuinely one-off accent colors (e.g. the amber "temp"
+// tone, the teal "low" temp tone) are left as inline hex since they're not
+// part of this reused red scale.
+#define NIGHT_RED_BRIGHT 0xF800  // full-intensity red — most prominent elements
+#define NIGHT_RED_MED     0x8000  // medium red — secondary elements
+#define NIGHT_RED_DIM      0x4000  // dim red — least prominent elements
+#define NIGHT_AMBER_WARN 0x8400  // warning/elevated-state accent
 
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
-#define OS_VERSION    "CALLOWAY_OS v2.0"
+#define OS_VERSION       "CALLOWAY_OS v2.0"
+#define WIFI_SETUP_AP_NAME "OmniCore-Setup"
 const char* weatherKey  = WEATHER_API_KEY;
 String currentCity      = "Asheville,US";   // updated by syncLocationAndTime()
 long   currentUtcOffset = -14400;           // updated by syncLocationAndTime()
@@ -142,15 +154,50 @@ long   currentUtcOffset = -14400;           // updated by syncLocationAndTime()
 #define AQ_CO2_X         8
 #define AQ_VOC_X       200
 
+// Overall air-quality status — sits in the open strip between the divider
+// and the PM row. X starts at 30 like the PM/AQ rows, clearing the lux bar
+// (which only occupies x:15-29) further down at the same Y range.
+#define STATUS_ROW_Y   228   // screen Y where the status canvas is pushed
+#define STATUS_DOT_X    30   // canvas-local
+#define STATUS_DOT_Y    12   // canvas-local
+#define STATUS_DOT_R      6
+#define STATUS_TEXT_X    44  // canvas-local
+
 // Menu geometry
 #define MENU_X          20
 #define MENU_Y          40
 #define MENU_W         440
 #define MENU_H         240
+#define MENU_ITEM_COUNT   7  // Night Mode, Temp Unit, Military Time, Brightness, Auto Dim, Reset WiFi, Close
+#define MENU_VISIBLE      5  // rows shown at once; scroll arrows page through the rest
 #define MENU_ITEM_H     35
 #define MENU_FIRST_Y   105  // Y baseline of first menu item
 #define MENU_CLOSE_X   430  // X close button X position
 #define MENU_CLOSE_Y    55  // X close button Y position
+
+// Close button tap target — drawn as bare "X" text (no button rect), so this
+// hit box is hand-tuned around the glyph rather than derived from a draw call.
+#define MENU_CLOSE_HIT_X1 415
+#define MENU_CLOSE_HIT_X2 455
+#define MENU_CLOSE_HIT_Y1  42
+#define MENU_CLOSE_HIT_Y2  72
+
+// Scroll arrow buttons — same rect used to draw (drawMenu) and hit-test
+// (handleMenuTouch), so the tap target can never drift out of sync with
+// what's actually drawn on screen.
+#define MENU_SCROLL_UP_X    335
+#define MENU_SCROLL_DOWN_X  380
+#define MENU_SCROLL_BTN_W    35
+#define MENU_SCROLL_Y       253
+#define MENU_SCROLL_H        25
+
+// Reset-confirm YES/NO buttons — same rect used to draw (drawResetConfirm)
+// and hit-test (handleResetConfirmTouch), so they can't drift apart.
+#define RESET_YES_X   60
+#define RESET_NO_X   270
+#define RESET_BTN_Y  180
+#define RESET_BTN_W  150
+#define RESET_BTN_H   40
 
 // Brightness slider
 #define SLIDER_X        40
@@ -203,31 +250,48 @@ GFXcanvas16 localCanvas(220, 55);   // top left — SCD40 temp and humidity
 GFXcanvas16 pmCanvas(440, 24);      // particulates — PM1, PM2.5, PM4, PM10
 GFXcanvas16 aqCanvas(440, 24);      // bottom — CO2 and VOC index
 GFXcanvas16 dateCanvas(320, 24);    // date line — only redraws on minute change
+GFXcanvas16 statusCanvas(440, 24);  // overall air-quality status dot + label
 
 // =============================================================================
-// STATE
+// SETTINGS — persisted to NVS. loadSettings()/saveSettings() are the only
+// functions that touch flash for these; everything else just reads/writes
+// the struct directly.
 // =============================================================================
-int  lastMin = -1, lastSec = -1;    // dirty bits — only redraw when changed
-bool isNightMode          = false;
-bool hasWeatherData       = false;   // gates weather display until first fetch
-bool hasSCD40Data         = false;   // gates sensor display until first read
-bool hasSEN54Data         = false;   // gates PM/VOC display until first valid read
-bool isCelsius            = false;
-bool isMilitaryTime       = false;
-bool isAutoDim            = false;
-int  brightness           = 3;       // index into BRIGHTNESS_STEPS
-bool menuOpen             = false;
-bool brightnessSliderOpen = false;
-bool awaitingResetConfirm = false;
-int  menuOffset           = 0;       // first visible menu item index
+struct Settings {
+  bool isNightMode    = false;
+  bool isCelsius      = false;
+  bool isMilitaryTime = false;
+  bool isAutoDim      = false;
+  int  brightness     = 3;  // index into BRIGHTNESS_STEPS
+};
+
+Settings settings;
+
+// =============================================================================
+// UI STATE — resets every boot, never touches flash.
+// =============================================================================
+struct UiState {
+  int  lastMin = -1, lastSec = -1;     // dirty bits — only redraw when changed
+  bool hasWeatherData       = false;   // gates weather display until first fetch
+  bool menuOpen             = false;
+  bool brightnessSliderOpen = false;
+  bool awaitingResetConfirm = false;
+  int  menuOffset           = 0;       // first visible menu item index
+};
+
+UiState ui;
 
 // Touch state — start position only, last position unreliable on FT6236 lift
-bool          touchActive    = false;
-int           touchStartX    = 0;
-int           touchStartY    = 0;
-unsigned long touchStartTime = 0;
-unsigned long lastTapTime   = 0;
-unsigned long lastTouchPoll = 0;
+struct TouchState {
+  bool          active    = false;  // currently mid-touch
+  int           startX    = 0;
+  int           startY    = 0;
+  unsigned long startTime = 0;
+  unsigned long lastTap   = 0;  // debounce: ignore taps under 400ms apart
+  unsigned long lastPoll  = 0;  // throttles I2C polling to 50Hz
+};
+
+TouchState touchState;
 
 // Weather globals — written by fetchWeather(), read by updateWeatherDisplay()
 float  g_currentTemp = 0;
@@ -235,16 +299,27 @@ float  g_tempHigh    = 0;
 float  g_tempLow     = 0;
 String g_skyStatus   = "";
 
-// Sensor globals — written by updateLocalSensors(), read by updateSensorDisplay()
-float    g_lux       = 0;
-float    g_localTemp = 0;  // SCD40, stored as Fahrenheit, converted on display
-float    g_humidity  = 0;  // SCD40
-uint16_t g_co2       = 0;  // SCD40, ppm
-float    g_pm1       = 0;  // SEN54, ug/m3
-float    g_pm25      = 0;  // SEN54, ug/m3
-float    g_pm4       = 0;  // SEN54, ug/m3
-float    g_pm10      = 0;  // SEN54, ug/m3
-float    g_voc       = 0;  // SEN54, index 0-500 (100 = your baseline)
+// Sensor readings — written by updateLocalSensors(), read by updateSensorDisplay()
+// and sampleHistory(). Each sensor's own "Valid" flag gates its fields until
+// the first real reading comes in. TSL2591's lux has no such gate — it always
+// returns a usable value (0 in darkness/failure is itself a valid reading).
+struct SensorReadings {
+  float lux = 0;  // TSL2591
+
+  bool     scd40Valid = false;  // gates co2/localTemp/humidity until first read
+  uint16_t co2        = 0;      // ppm
+  float    localTemp  = 0;      // stored as Fahrenheit, converted on display
+  float    humidity   = 0;
+
+  bool  sen54Valid = false;  // gates pm1/pm25/pm4/pm10/voc until first valid read
+  float pm1  = 0;  // ug/m3
+  float pm25 = 0;  // ug/m3
+  float pm4  = 0;  // ug/m3
+  float pm10 = 0;  // ug/m3
+  float voc  = 0;  // index 0-500 (100 = your baseline)
+};
+
+SensorReadings sensors;
 
 // =============================================================================
 // HISTORY — in-RAM ring buffer feeding the web dashboard's 24hr graphs.
@@ -271,7 +346,7 @@ HistoryPoint historyBuf[HISTORY_SIZE];
 int  historyHead  = 0;      // index where the next point will be written
 int  historyCount = 0;      // how many valid points exist so far (caps at HISTORY_SIZE)
 
-// Pushes the current sensor globals into the ring buffer as one new point.
+// Pushes the current sensor readings into the ring buffer as one new point.
 // Called on its own 60s timer from loop() — independent of the 1s sensor poll.
 //
 // Timestamps are real UTC epoch seconds from the NTP-synced system clock
@@ -289,15 +364,15 @@ void sampleHistory() {
   if (now < 1000000000) return; // ~Sept 2001 — anything before this isn't real NTP time
 
   p.t        = (uint32_t)now;
-  p.co2      = g_co2;
-  p.temp     = g_localTemp;
-  p.humidity = g_humidity;
-  p.pm1      = g_pm1;
-  p.pm25     = g_pm25;
-  p.pm4      = g_pm4;
-  p.pm10     = g_pm10;
-  p.voc      = g_voc;
-  p.lux      = g_lux;
+  p.co2      = sensors.co2;
+  p.temp     = sensors.localTemp;
+  p.humidity = sensors.humidity;
+  p.pm1      = sensors.pm1;
+  p.pm25     = sensors.pm25;
+  p.pm4      = sensors.pm4;
+  p.pm10     = sensors.pm10;
+  p.voc      = sensors.voc;
+  p.lux      = sensors.lux;
 
   historyHead = (historyHead + 1) % HISTORY_SIZE;
   if (historyCount < HISTORY_SIZE) historyCount++;
@@ -325,36 +400,59 @@ struct ColorPalette {
   uint16_t pm25Good;  // < 12 ug/m3
   uint16_t pm25Warn;  // 12–35 ug/m3
   uint16_t pm25High;  // > 35 ug/m3
+
+  // Settings menu, brightness slider, and reset-confirm dialog pull colors
+  // from these too, so Night Mode applies uniformly across the whole UI,
+  // not just the dashboard.
+  uint16_t menuPanelBg;    // menu/slider/reset dialog background
+  uint16_t menuAccent;     // border, headers, divider, scroll thumb/arrows, slider fill
+  uint16_t menuText;       // item labels, values, YES button text
+  uint16_t menuMutedText;  // close "X", reset dialog body copy
+  uint16_t menuDimText;    // item ">" arrow, slider 25%/100% labels
+  uint16_t menuRowBg;      // menu item row background
+  uint16_t menuControlBg;  // scrollbar track, scroll arrow buttons, reset NO button bg
+  uint16_t menuSubtle;     // slider track fill, footer hint text
+  uint16_t menuWarn;       // reset dialog border, YES button bg
 };
 
 ColorPalette getColorPalette() {
-  if (isNightMode) {
-    return { 0xF800, 0x8000, 0xA000, 0x4000, 0x8000, 0xFBE0, 0xF800, 0x0410,
-             0x8000, 0x2104, 0x0400, 0x4000,
-             0x4000, 0x8400, 0x8000,
-             0x4000, 0x8400, 0x8000 };
+  if (settings.isNightMode) {
+    return {
+      .clock = NIGHT_RED_BRIGHT, .date = NIGHT_RED_MED, .ampm = 0xA000, .line = NIGHT_RED_DIM,
+      .city = NIGHT_RED_MED, .temp = 0xFBE0, .high = NIGHT_RED_BRIGHT, .low = 0x0410,
+      .luxBar = NIGHT_RED_MED, .luxBg = TFT_DARKBG, .wifiActive = 0x0400, .wifiInactive = NIGHT_RED_DIM,
+      .co2Good = NIGHT_RED_DIM, .co2Warn = NIGHT_AMBER_WARN, .co2High = NIGHT_RED_MED,
+      .pm25Good = NIGHT_RED_DIM, .pm25Warn = NIGHT_AMBER_WARN, .pm25High = NIGHT_RED_MED,
+
+      .menuPanelBg = 0x2000, .menuAccent = NIGHT_RED_BRIGHT, .menuText = NIGHT_RED_BRIGHT,
+      .menuMutedText = NIGHT_RED_MED, .menuDimText = NIGHT_RED_DIM, .menuRowBg = TFT_DARKBG,
+      .menuControlBg = TFT_DARKBG, .menuSubtle = TFT_DARKBG, .menuWarn = NIGHT_RED_BRIGHT,
+    };
   } else {
     return {
-      TFT_WHITE, TFT_LIGHTGREY, TFT_YELLOW,
-      TFT_DARKGREY, TFT_LIGHTGREY, TFT_ORANGE,
-      TFT_RED, TFT_CYAN,
-      TFT_YELLOW, 0x2104, TFT_GREEN, TFT_RED,
-      TFT_GREEN, TFT_YELLOW, TFT_RED,
-      TFT_GREEN, TFT_YELLOW, TFT_RED
+      .clock = TFT_WHITE, .date = TFT_LIGHTGREY, .ampm = TFT_YELLOW, .line = TFT_DARKGREY,
+      .city = TFT_LIGHTGREY, .temp = TFT_ORANGE, .high = TFT_RED, .low = TFT_CYAN,
+      .luxBar = TFT_YELLOW, .luxBg = TFT_DARKBG, .wifiActive = TFT_GREEN, .wifiInactive = TFT_RED,
+      .co2Good = TFT_GREEN, .co2Warn = TFT_YELLOW, .co2High = TFT_RED,
+      .pm25Good = TFT_GREEN, .pm25Warn = TFT_YELLOW, .pm25High = TFT_RED,
+
+      .menuPanelBg = 0x1082, .menuAccent = TFT_CYAN, .menuText = TFT_WHITE,
+      .menuMutedText = TFT_LIGHTGREY, .menuDimText = TFT_DARKGREY, .menuRowBg = 0x0821,
+      .menuControlBg = TFT_DARKBG, .menuSubtle = 0x4208, .menuWarn = TFT_RED,
     };
   }
 }
 
 uint16_t getCO2Color(ColorPalette col) {
-  if (g_co2 < 800)  return col.co2Good;
-  if (g_co2 < 1200) return col.co2Warn;
+  if (sensors.co2 < 800)  return col.co2Good;
+  if (sensors.co2 < 1200) return col.co2Warn;
   return col.co2High;
 }
 
 // PM2.5 is the health-relevant particulate number — EPA breakpoints in ug/m3
 uint16_t getPM25Color(ColorPalette col) {
-  if (g_pm25 < 12.0) return col.pm25Good;
-  if (g_pm25 < 35.0) return col.pm25Warn;
+  if (sensors.pm25 < 12.0) return col.pm25Good;
+  if (sensors.pm25 < 35.0) return col.pm25Warn;
   return col.pm25High;
 }
 
@@ -388,7 +486,7 @@ void updateLocalSensors();
 void updateTimeDisplay();
 void updateWeatherDisplay();
 void updateSensorDisplay();
-void drawWiFiIcon(int x, int y);
+void drawWiFiIcon();
 void runKITTScanner(int x);
 void handleRoot();
 void handleData();
@@ -512,20 +610,20 @@ void loop() {
 
   if (currentMillis - lastClockTime >= clockInterval) {
     checkWiFiHealth();
-    if (!menuOpen) updateTimeDisplay();
+    if (!ui.menuOpen) updateTimeDisplay();
     checkDaylightSavings();
     lastClockTime = currentMillis;
   }
 
   if (currentMillis - lastWifiIconTime >= wifiIconInterval) {
-    if (!menuOpen) drawWiFiIcon(WIFI_ICON_X, WIFI_ICON_Y);
+    if (!ui.menuOpen) drawWiFiIcon();
     lastWifiIconTime = currentMillis;
   }
 
   if (currentMillis - lastSensorTime >= sensorInterval) {
     updateLocalSensors();
     applyBrightness();
-    if (!menuOpen) updateSensorDisplay();
+    if (!ui.menuOpen) updateSensorDisplay();
     lastSensorTime = currentMillis;
   }
 
@@ -538,7 +636,7 @@ void loop() {
 
     if (currentMillis - lastWeatherTime >= weatherInterval || lastWeatherTime == 0) {
       if (fetchWeather()) {
-        if (!menuOpen) updateWeatherDisplay();
+        if (!ui.menuOpen) updateWeatherDisplay();
       } else {
         Serial.println("[Weather] Fetch failed — retry in 15min");
       }
@@ -569,27 +667,27 @@ void mapTouch(TS_Point p, int &x, int &y) {
 void checkTouch() {
   // limit touch polling to 50Hz — reduces I2C bus contention with sensors
   unsigned long now = millis();
-  if (now - lastTouchPoll < 20) return;
-  lastTouchPoll = now;
+  if (now - touchState.lastPoll < 20) return;
+  touchState.lastPoll = now;
 
   if (!touch.touched()) {
-    if (touchActive) {
-      touchActive = false;
-      unsigned long holdTime = millis() - touchStartTime;
+    if (touchState.active) {
+      touchState.active = false;
+      unsigned long holdTime = millis() - touchState.startTime;
 
       // process as tap if short touch and not too soon after last tap
-      if (holdTime > 10 && holdTime < 500 && millis() - lastTapTime > 400) {
-        lastTapTime = millis();
-        if (awaitingResetConfirm) {
-          handleResetConfirmTouch(touchStartX, touchStartY);
-        } else if (brightnessSliderOpen) {
-          if (touchStartY < SLIDER_Y - 40 || touchStartY > SLIDER_Y + 60) {
-            brightnessSliderOpen = false;
+      if (holdTime > 10 && holdTime < 500 && millis() - touchState.lastTap > 400) {
+        touchState.lastTap = millis();
+        if (ui.awaitingResetConfirm) {
+          handleResetConfirmTouch(touchState.startX, touchState.startY);
+        } else if (ui.brightnessSliderOpen) {
+          if (touchState.startY < SLIDER_Y - 40 || touchState.startY > SLIDER_Y + 60) {
+            ui.brightnessSliderOpen = false;
             saveSettings();
             drawMenu();
           }
-        } else if (menuOpen) {
-          handleMenuTouch(touchStartX, touchStartY);
+        } else if (ui.menuOpen) {
+          handleMenuTouch(touchState.startX, touchState.startY);
         } else {
           openMenu();
         }
@@ -602,21 +700,22 @@ void checkTouch() {
   int x, y;
   mapTouch(p, x, y);
 
-  if (!touchActive) {
-    touchActive    = true;
-    touchStartX    = x;
-    touchStartY    = y;
-    touchStartTime = millis();
+  if (!touchState.active) {
+    touchState.active    = true;
+    touchState.startX    = x;
+    touchState.startY    = y;
+    touchState.startTime = millis();
   }
 
-  if (brightnessSliderOpen) {
+  if (ui.brightnessSliderOpen) {
     handleSliderTouch(x, y);
   }
 }
 
 void handleMenuTouch(int x, int y) {
   // X close button — top right corner of menu
-  if (x > 415 && x < 455 && y > 42 && y < 72) {
+  if (x > MENU_CLOSE_HIT_X1 && x < MENU_CLOSE_HIT_X2 &&
+      y > MENU_CLOSE_HIT_Y1 && y < MENU_CLOSE_HIT_Y2) {
     closeMenu();
     return;
   }
@@ -627,28 +726,30 @@ void handleMenuTouch(int x, int y) {
     return;
   }
 
-  // up arrow button
-  if (x > 335 && x < 370 && y > 253 && y < 278) {
-    if (menuOffset > 0) {
-      menuOffset--;
+  // up arrow button — same rect drawMenu() draws it with
+  if (x > MENU_SCROLL_UP_X && x < MENU_SCROLL_UP_X + MENU_SCROLL_BTN_W &&
+      y > MENU_SCROLL_Y && y < MENU_SCROLL_Y + MENU_SCROLL_H) {
+    if (ui.menuOffset > 0) {
+      ui.menuOffset--;
       drawMenu();
     }
     return;
   }
 
-  // down arrow button
-  if (x > 380 && x < 415 && y > 253 && y < 278) {
-    if (menuOffset + 5 < 7) {
-      menuOffset++;
+  // down arrow button — same rect drawMenu() draws it with
+  if (x > MENU_SCROLL_DOWN_X && x < MENU_SCROLL_DOWN_X + MENU_SCROLL_BTN_W &&
+      y > MENU_SCROLL_Y && y < MENU_SCROLL_Y + MENU_SCROLL_H) {
+    if (ui.menuOffset + MENU_VISIBLE < MENU_ITEM_COUNT) {
+      ui.menuOffset++;
       drawMenu();
     }
     return;
   }
 
   // check which item row was tapped
-  for (int i = 0; i < 5; i++) {
-    int itemIdx    = i + menuOffset;
-    if (itemIdx >= 7) break;
+  for (int i = 0; i < MENU_VISIBLE; i++) {
+    int itemIdx    = i + ui.menuOffset;
+    if (itemIdx >= MENU_ITEM_COUNT) break;
     int itemTop    = MENU_FIRST_Y - 18 + (i * MENU_ITEM_H);
     int itemBottom = itemTop + MENU_ITEM_H;
     if (y >= itemTop && y <= itemBottom) {
@@ -659,9 +760,10 @@ void handleMenuTouch(int x, int y) {
 }
 
 void handleResetConfirmTouch(int x, int y) {
-  // YES button
-  if (x > 60 && x < 210 && y > 180 && y < 220) {
-    awaitingResetConfirm = false;
+  // YES button — same rect drawResetConfirm() draws it with
+  if (x > RESET_YES_X && x < RESET_YES_X + RESET_BTN_W &&
+      y > RESET_BTN_Y && y < RESET_BTN_Y + RESET_BTN_H) {
+    ui.awaitingResetConfirm = false;
     prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
     prefs.begin("settings",  false); prefs.clear(); prefs.end();
     WiFiManager wm; wm.resetSettings();
@@ -669,9 +771,10 @@ void handleResetConfirmTouch(int x, int y) {
     delay(2000);
     ESP.restart();
   }
-  // NO button
-  if (x > 270 && x < 420 && y > 180 && y < 220) {
-    awaitingResetConfirm = false;
+  // NO button — same rect drawResetConfirm() draws it with
+  if (x > RESET_NO_X && x < RESET_NO_X + RESET_BTN_W &&
+      y > RESET_BTN_Y && y < RESET_BTN_Y + RESET_BTN_H) {
+    ui.awaitingResetConfirm = false;
     drawMenu();
   }
 }
@@ -689,8 +792,8 @@ void handleSliderTouch(int x, int y) {
     if (diff < minDiff) { minDiff = diff; nearest = i; }
   }
 
-  if (nearest != brightness) {
-    brightness = nearest;
+  if (nearest != settings.brightness) {
+    settings.brightness = nearest;
     applyBrightness();
     drawBrightnessSlider();
   }
@@ -701,60 +804,60 @@ void handleSliderTouch(int x, int y) {
 // =============================================================================
 
 void openMenu() {
-  menuOpen             = true;
-  brightnessSliderOpen = false;
-  awaitingResetConfirm = false;
-  menuOffset           = 0;
+  ui.menuOpen             = true;
+  ui.brightnessSliderOpen = false;
+  ui.awaitingResetConfirm = false;
+  ui.menuOffset           = 0;
   drawMenu();
 }
 
 void closeMenu() {
-  menuOpen             = false;
-  brightnessSliderOpen = false;
-  awaitingResetConfirm = false;
+  ui.menuOpen             = false;
+  ui.brightnessSliderOpen = false;
+  ui.awaitingResetConfirm = false;
   tft->fillScreen(TFT_BLACK);
-  lastMin = -1;
-  lastSec = -1; // force full dashboard redraw
+  ui.lastMin = -1;
+  ui.lastSec = -1; // force full dashboard redraw
   updateTimeDisplay();
   updateWeatherDisplay();
   updateSensorDisplay();
-  drawWiFiIcon(WIFI_ICON_X, WIFI_ICON_Y);
+  drawWiFiIcon();
 }
 
 void selectMenuItem(int itemIdx) {
   switch (itemIdx) {
     case 0: // Night Mode
-      isNightMode = !isNightMode;
+      settings.isNightMode = !settings.isNightMode;
       saveSettings();
       drawMenu();
       break;
 
     case 1: // Temp Unit
-      isCelsius = !isCelsius;
+      settings.isCelsius = !settings.isCelsius;
       saveSettings();
       drawMenu();
       break;
 
     case 2: // Military Time
-      isMilitaryTime = !isMilitaryTime;
+      settings.isMilitaryTime = !settings.isMilitaryTime;
       saveSettings();
       drawMenu();
       break;
 
     case 3: // Brightness — open slider
-      brightnessSliderOpen = true;
+      ui.brightnessSliderOpen = true;
       drawBrightnessSlider();
       break;
 
     case 4: // Auto Dim
-      isAutoDim = !isAutoDim;
+      settings.isAutoDim = !settings.isAutoDim;
       applyBrightness();
       saveSettings();
       drawMenu();
       break;
 
     case 5: // Reset WiFi
-      awaitingResetConfirm = true;
+      ui.awaitingResetConfirm = true;
       drawResetConfirm();
       break;
 
@@ -765,58 +868,58 @@ void selectMenuItem(int itemIdx) {
 }
 
 void drawScrollbar() {
+  ColorPalette col = getColorPalette();
   const int trackX = 450, trackY = 78, trackH = 190;
-  const int visible = 5, itemCount = 7;
 
-  int thumbH = (visible * trackH) / itemCount;
-  int thumbY = trackY + (menuOffset * trackH) / itemCount;
+  int thumbH = (MENU_VISIBLE * trackH) / MENU_ITEM_COUNT;
+  int thumbY = trackY + (ui.menuOffset * trackH) / MENU_ITEM_COUNT;
 
-  tft->fillRect(trackX, trackY, 4, trackH, 0x2104);
-  tft->fillRect(trackX, thumbY, 4, thumbH, TFT_CYAN);
+  tft->fillRect(trackX, trackY, 4, trackH, col.menuControlBg);
+  tft->fillRect(trackX, thumbY, 4, thumbH, col.menuAccent);
 }
 
 void drawMenu() {
+  ColorPalette col = getColorPalette();
   const char* items[] = {
     "Night Mode", "Temp Unit", "Military Time",
     "Brightness", "Auto Dim", "Reset WiFi", "Close"
   };
-  const int itemCount = 7, visible = 5;
 
-  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, 0x1082);
-  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, TFT_CYAN);
+  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuPanelBg);
+  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuAccent);
 
   tft->setFont(&FreeSans9pt7b);
-  tft->setTextColor(TFT_CYAN);
+  tft->setTextColor(col.menuAccent);
   tft->setCursor(185, 65);
   tft->print("SETTINGS");
-  tft->drawFastHLine(30, 75, 410, TFT_CYAN);
+  tft->drawFastHLine(30, 75, 410, col.menuAccent);
 
-  tft->setTextColor(TFT_LIGHTGREY);
+  tft->setTextColor(col.menuMutedText);
   tft->setCursor(MENU_CLOSE_X, MENU_CLOSE_Y);
   tft->print("X");
 
-  for (int i = 0; i < visible; i++) {
-    int itemIdx = i + menuOffset;
-    if (itemIdx >= itemCount) break;
+  for (int i = 0; i < MENU_VISIBLE; i++) {
+    int itemIdx = i + ui.menuOffset;
+    if (itemIdx >= MENU_ITEM_COUNT) break;
     int itemY = MENU_FIRST_Y + (i * MENU_ITEM_H);
 
-    tft->fillRoundRect(30, itemY - 16, 410, MENU_ITEM_H - 2, 4, 0x0821);
+    tft->fillRoundRect(30, itemY - 16, 410, MENU_ITEM_H - 2, 4, col.menuRowBg);
     tft->setFont(&FreeSans9pt7b);
-    tft->setTextColor(TFT_WHITE);
+    tft->setTextColor(col.menuText);
     tft->setCursor(50, itemY);
     tft->print(items[itemIdx]);
 
     tft->setCursor(340, itemY);
-    if (itemIdx == 0) tft->print(isNightMode    ? "ON"  : "OFF");
-    if (itemIdx == 1) tft->print(isCelsius      ? "C"   : "F");
-    if (itemIdx == 2) tft->print(isMilitaryTime ? "ON"  : "OFF");
+    if (itemIdx == 0) tft->print(settings.isNightMode    ? "ON"  : "OFF");
+    if (itemIdx == 1) tft->print(settings.isCelsius      ? "C"   : "F");
+    if (itemIdx == 2) tft->print(settings.isMilitaryTime ? "ON"  : "OFF");
     if (itemIdx == 3) {
-      int pct = map(BRIGHTNESS_STEPS[brightness], 64, 255, 25, 100);
+      int pct = map(BRIGHTNESS_STEPS[settings.brightness], 64, 255, 25, 100);
       tft->printf("%d%%", pct);
     }
-    if (itemIdx == 4) tft->print(isAutoDim ? "ON" : "OFF");
+    if (itemIdx == 4) tft->print(settings.isAutoDim ? "ON" : "OFF");
 
-    tft->setTextColor(TFT_DARKGREY);
+    tft->setTextColor(col.menuDimText);
     tft->setCursor(420, itemY);
     tft->print(">");
   }
@@ -824,85 +927,87 @@ void drawMenu() {
   drawScrollbar();
 
   // scroll buttons
-  tft->fillRoundRect(335, 253, 35, 25, 4, 0x2104);
+  tft->fillRoundRect(MENU_SCROLL_UP_X, MENU_SCROLL_Y, MENU_SCROLL_BTN_W, MENU_SCROLL_H, 4, col.menuControlBg);
   tft->setFont(&FreeSans9pt7b);
-  tft->setTextColor(TFT_CYAN);
+  tft->setTextColor(col.menuAccent);
   tft->setCursor(344, 271);
   tft->print("^");
 
-  tft->fillRoundRect(380, 253, 35, 25, 4, 0x2104);
-  tft->setTextColor(TFT_CYAN);
+  tft->fillRoundRect(MENU_SCROLL_DOWN_X, MENU_SCROLL_Y, MENU_SCROLL_BTN_W, MENU_SCROLL_H, 4, col.menuControlBg);
+  tft->setTextColor(col.menuAccent);
   tft->setCursor(389, 271);
   tft->print("v");
 
   tft->setFont(NULL);
-  tft->setTextColor(0x4208);
+  tft->setTextColor(col.menuSubtle);
   tft->setCursor(30, 278);
   tft->print("Tap X to close");
 }
 
 void drawBrightnessSlider() {
-  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, 0x1082);
-  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, TFT_CYAN);
+  ColorPalette col = getColorPalette();
+  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuPanelBg);
+  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuAccent);
 
   tft->setFont(&FreeSans9pt7b);
-  tft->setTextColor(TFT_CYAN);
+  tft->setTextColor(col.menuAccent);
   tft->setCursor(170, 80);
   tft->print("BRIGHTNESS");
-  tft->drawFastHLine(30, 90, 410, TFT_CYAN);
+  tft->drawFastHLine(30, 90, 410, col.menuAccent);
 
-  int pct = map(BRIGHTNESS_STEPS[brightness], 64, 255, 25, 100);
+  int pct = map(BRIGHTNESS_STEPS[settings.brightness], 64, 255, 25, 100);
   tft->setFont(&FreeSansBold18pt7b);
-  tft->setTextColor(TFT_WHITE);
+  tft->setTextColor(col.menuText);
   tft->setCursor(200, 140);
   tft->printf("%d%%", pct);
 
   // track
-  tft->fillRoundRect(SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H, 6, 0x4208);
+  tft->fillRoundRect(SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H, 6, col.menuSubtle);
   // fill
   int fillW = map(pct, 25, 100, 0, SLIDER_W);
-  tft->fillRoundRect(SLIDER_X, SLIDER_Y, fillW, SLIDER_H, 6, TFT_CYAN);
+  tft->fillRoundRect(SLIDER_X, SLIDER_Y, fillW, SLIDER_H, 6, col.menuAccent);
   // thumb
   int thumbX = SLIDER_X + fillW;
-  tft->fillCircle(thumbX, SLIDER_Y + SLIDER_H / 2, SLIDER_THUMB_R, TFT_WHITE);
-  tft->drawCircle(thumbX, SLIDER_Y + SLIDER_H / 2, SLIDER_THUMB_R, TFT_CYAN);
+  tft->fillCircle(thumbX, SLIDER_Y + SLIDER_H / 2, SLIDER_THUMB_R, col.menuText);
+  tft->drawCircle(thumbX, SLIDER_Y + SLIDER_H / 2, SLIDER_THUMB_R, col.menuAccent);
 
   tft->setFont(&FreeSans9pt7b);
-  tft->setTextColor(TFT_DARKGREY);
+  tft->setTextColor(col.menuDimText);
   tft->setCursor(SLIDER_X, SLIDER_Y + 35);
   tft->print("25%");
   tft->setCursor(SLIDER_X + SLIDER_W - 25, SLIDER_Y + 35);
   tft->print("100%");
 
   tft->setFont(NULL);
-  tft->setTextColor(0x4208);
+  tft->setTextColor(col.menuSubtle);
   tft->setCursor(120, 220);
   tft->print("Drag to adjust  |  Tap outside to save & close");
 }
 
 void drawResetConfirm() {
-  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, 0x1082);
-  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, TFT_RED);
+  ColorPalette col = getColorPalette();
+  tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuPanelBg);
+  tft->drawRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuWarn);
 
   tft->setFont(&FreeSans9pt7b);
-  tft->setTextColor(TFT_WHITE);
+  tft->setTextColor(col.menuText);
   tft->setCursor(100, 100);
   tft->print("Reset WiFi credentials?");
 
-  tft->setTextColor(TFT_LIGHTGREY);
+  tft->setTextColor(col.menuMutedText);
   tft->setCursor(80, 130);
   tft->print("This will erase your saved WiFi and");
   tft->setCursor(80, 150);
   tft->print("restart the setup portal.");
 
-  tft->fillRoundRect(60, 180, 150, 40, 6, TFT_RED);
-  tft->setTextColor(TFT_WHITE);
+  tft->fillRoundRect(RESET_YES_X, RESET_BTN_Y, RESET_BTN_W, RESET_BTN_H, 6, col.menuWarn);
+  tft->setTextColor(col.menuText);
   tft->setCursor(115, 205);
   tft->print("YES");
 
-  tft->fillRoundRect(270, 180, 150, 40, 6, 0x2104);
-  tft->drawRoundRect(270, 180, 150, 40, 6, TFT_CYAN);
-  tft->setTextColor(TFT_CYAN);
+  tft->fillRoundRect(RESET_NO_X, RESET_BTN_Y, RESET_BTN_W, RESET_BTN_H, 6, col.menuControlBg);
+  tft->drawRoundRect(RESET_NO_X, RESET_BTN_Y, RESET_BTN_W, RESET_BTN_H, 6, col.menuAccent);
+  tft->setTextColor(col.menuAccent);
   tft->setCursor(330, 205);
   tft->print("NO");
 }
@@ -917,9 +1022,9 @@ void updateTimeDisplay() {
 
   ColorPalette col = getColorPalette();
 
-  if (timeinfo.tm_sec != lastSec) {
+  if (timeinfo.tm_sec != ui.lastSec) {
 
-    if (timeinfo.tm_min != lastMin) {
+    if (timeinfo.tm_min != ui.lastMin) {
       char dateBuf[25];
       strftime(dateBuf, 25, "%A, %b %d", &timeinfo);
 
@@ -931,7 +1036,7 @@ void updateTimeDisplay() {
 
       tft->draw16bitRGBBitmap(60, 156, dateCanvas.getBuffer(), 320, 24);
       tft->drawFastHLine(60, DIVIDER_Y, 320, col.line);
-      lastMin = timeinfo.tm_min;
+      ui.lastMin = timeinfo.tm_min;
     }
 
     clockCanvas.fillScreen(TFT_BLACK);
@@ -939,7 +1044,7 @@ void updateTimeDisplay() {
     clockCanvas.setTextColor(col.clock);
     clockCanvas.setCursor(5, 50);
 
-    if (isMilitaryTime) {
+    if (settings.isMilitaryTime) {
       clockCanvas.printf("%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     } else {
       int hour12 = timeinfo.tm_hour % 12;
@@ -953,19 +1058,19 @@ void updateTimeDisplay() {
     }
 
     tft->draw16bitRGBBitmap(CLOCK_X, CLOCK_Y, clockCanvas.getBuffer(), 420, 65);
-    lastSec = timeinfo.tm_sec;
+    ui.lastSec = timeinfo.tm_sec;
   }
 }
 
 void updateWeatherDisplay() {
-  if (!hasWeatherData) return;
+  if (!ui.hasWeatherData) return;
 
   ColorPalette col = getColorPalette();
 
-  float displayTemp = isCelsius ? (g_currentTemp - 32) * 5.0 / 9.0 : g_currentTemp;
-  float displayHigh = isCelsius ? (g_tempHigh    - 32) * 5.0 / 9.0 : g_tempHigh;
-  float displayLow  = isCelsius ? (g_tempLow     - 32) * 5.0 / 9.0 : g_tempLow;
-  const char* unit  = isCelsius ? "C" : "F";
+  float displayTemp = settings.isCelsius ? (g_currentTemp - 32) * 5.0 / 9.0 : g_currentTemp;
+  float displayHigh = settings.isCelsius ? (g_tempHigh    - 32) * 5.0 / 9.0 : g_tempHigh;
+  float displayLow  = settings.isCelsius ? (g_tempLow     - 32) * 5.0 / 9.0 : g_tempLow;
+  const char* unit  = settings.isCelsius ? "C" : "F";
 
   tft->fillRect(280, 5, 195, 80, TFT_BLACK);
   tft->setFont(&FreeSans9pt7b);
@@ -991,14 +1096,14 @@ void updateSensorDisplay() {
   ColorPalette col = getColorPalette();
 
   // lux bar — vertical fill proportional to ambient light
-  int fillHeight = map(constrain((int)g_lux, 0, LUX_MAX), 0, LUX_MAX, 0, LUX_BAR_HEIGHT);
+  int fillHeight = map(constrain((int)sensors.lux, 0, LUX_MAX), 0, LUX_MAX, 0, LUX_BAR_HEIGHT);
   tft->fillRect(LUX_BAR_X, LUX_BAR_Y, LUX_BAR_WIDTH, LUX_BAR_HEIGHT, col.luxBg);
   tft->fillRect(LUX_BAR_X, LUX_BAR_Y + (LUX_BAR_HEIGHT - fillHeight), LUX_BAR_WIDTH, fillHeight, col.luxBar);
 
   // SCD40 temp and humidity — top left, waits for first valid read
-  if (hasSCD40Data) {
-    float displayLocalTemp = isCelsius ? (g_localTemp - 32) * 5.0 / 9.0 : g_localTemp;
-    const char* unit = isCelsius ? "C" : "F";
+  if (sensors.scd40Valid) {
+    float displayLocalTemp = settings.isCelsius ? (sensors.localTemp - 32) * 5.0 / 9.0 : sensors.localTemp;
+    const char* unit = settings.isCelsius ? "C" : "F";
 
     localCanvas.fillScreen(TFT_BLACK);
     localCanvas.setFont(&FreeSans9pt7b);
@@ -1007,64 +1112,88 @@ void updateSensorDisplay() {
     localCanvas.printf("%.1f%s", displayLocalTemp, unit);
     localCanvas.setTextColor(col.date);
     localCanvas.setCursor(LOCAL_X, LOCAL_HUM_Y);
-    localCanvas.printf("HUM: %.0f%%", g_humidity);
+    localCanvas.printf("HUM: %.0f%%", sensors.humidity);
 
     tft->draw16bitRGBBitmap(0, 5, localCanvas.getBuffer(), 220, 55);
   }
 
   // Particulate row — PM1 / PM2.5 / PM4 / PM10 from the SEN54.
   // PM2.5 is color coded since it is the health-relevant number.
-  if (hasSEN54Data) {
+  if (sensors.sen54Valid) {
     pmCanvas.fillScreen(TFT_BLACK);
     pmCanvas.setFont(&FreeSans9pt7b);
 
     pmCanvas.setTextColor(col.date);
     pmCanvas.setCursor(PM1_X, 17);
-    pmCanvas.printf("PM1:%.1f", g_pm1);
+    pmCanvas.printf("PM1:%.1f", sensors.pm1);
 
     pmCanvas.setTextColor(getPM25Color(col)); // the one that matters
     pmCanvas.setCursor(PM25_X, 17);
-    pmCanvas.printf("PM2.5:%.1f", g_pm25);
+    pmCanvas.printf("PM2.5:%.1f", sensors.pm25);
 
     pmCanvas.setTextColor(col.date);
     pmCanvas.setCursor(PM4_X, 17);
-    pmCanvas.printf("PM4:%.1f", g_pm4);
+    pmCanvas.printf("PM4:%.1f", sensors.pm4);
 
     pmCanvas.setCursor(PM10_X, 17);
-    pmCanvas.printf("PM10:%.1f", g_pm10);
+    pmCanvas.printf("PM10:%.1f", sensors.pm10);
 
     tft->draw16bitRGBBitmap(30, PM_ROW_Y, pmCanvas.getBuffer(), 440, 24);
   }
 
   // Air quality row — CO2 from SCD40, VOC index from SEN54.
   // Each is gated on its own sensor so one can appear before the other.
-  if (hasSCD40Data || hasSEN54Data) {
+  if (sensors.scd40Valid || sensors.sen54Valid) {
     aqCanvas.fillScreen(TFT_BLACK);
     aqCanvas.setFont(&FreeSans9pt7b);
 
-    if (hasSCD40Data) {
+    if (sensors.scd40Valid) {
       aqCanvas.setTextColor(getCO2Color(col));
       aqCanvas.setCursor(AQ_CO2_X, 17);
-      aqCanvas.printf("CO2:%dppm", g_co2);
+      aqCanvas.printf("CO2:%dppm", sensors.co2);
     }
 
-    if (hasSEN54Data) {
+    if (sensors.sen54Valid) {
       aqCanvas.setTextColor(col.date);
       aqCanvas.setCursor(AQ_VOC_X, 17);
-      aqCanvas.printf("VOC:%.0f", g_voc);
+      aqCanvas.printf("VOC:%.0f", sensors.voc);
     }
 
     tft->draw16bitRGBBitmap(30, AQ_ROW_Y, aqCanvas.getBuffer(), 440, 24);
   }
+
+  // Overall status — worst of CO2/PM2.5 bands, same verdict the web
+  // dashboard shows. Needs both sensors online since it's a "worst of
+  // both" read — showing it before either has warmed up would silently
+  // claim GOOD off a default-zero PM2.5 that hasn't actually been measured.
+  if (sensors.scd40Valid && sensors.sen54Valid) {
+    int co2Band = sensors.co2  < 800  ? 0 : sensors.co2  < 1200 ? 1 : 2;
+    int pmBand  = sensors.pm25 < 12.0 ? 0 : sensors.pm25 < 35.0 ? 1 : 2;
+    int worst   = max(co2Band, pmBand);
+
+    uint16_t statusColor = (worst == 0) ? col.co2Good : (worst == 1) ? col.co2Warn : col.co2High;
+    const char* statusLabel = (worst == 0) ? "AIR QUALITY: GOOD"
+                             : (worst == 1) ? "AIR QUALITY: ELEVATED"
+                                            : "AIR QUALITY: POOR";
+
+    statusCanvas.fillScreen(TFT_BLACK);
+    statusCanvas.fillCircle(STATUS_DOT_X, STATUS_DOT_Y, STATUS_DOT_R, statusColor);
+    statusCanvas.setFont(&FreeSans9pt7b);
+    statusCanvas.setTextColor(statusColor);
+    statusCanvas.setCursor(STATUS_TEXT_X, 17);
+    statusCanvas.print(statusLabel);
+
+    tft->draw16bitRGBBitmap(30, STATUS_ROW_Y, statusCanvas.getBuffer(), 440, 24);
+  }
 }
 
-void drawWiFiIcon(int x, int y) {
+void drawWiFiIcon() {
   ColorPalette col = getColorPalette();
   bool connected   = (WiFi.status() == WL_CONNECTED);
   int  bars        = !connected ? 0 : (WiFi.RSSI() > -60) ? 4 : (WiFi.RSSI() > -80) ? 2 : 1;
   uint16_t active  = connected ? col.wifiActive : col.wifiInactive;
   for (int i = 0; i < 4; i++) {
-    tft->fillRect(x + (i * 6), y + (12 - (i * 3)), 4, 4 + (i * 3),
+    tft->fillRect(WIFI_ICON_X + (i * 6), WIFI_ICON_Y + (12 - (i * 3)), 4, 4 + (i * 3),
                   (i < bars) ? active : col.luxBg);
   }
 }
@@ -1082,32 +1211,32 @@ void runKITTScanner(int x) {
 // =============================================================================
 
 void applyBrightness() {
-  if (isAutoDim) {
-    int pwm = map(constrain((int)g_lux, 0, LUX_MAX), 0, LUX_MAX, AUTO_DIM_MIN, AUTO_DIM_MAX);
+  if (settings.isAutoDim) {
+    int pwm = map(constrain((int)sensors.lux, 0, LUX_MAX), 0, LUX_MAX, AUTO_DIM_MIN, AUTO_DIM_MAX);
     ledcWrite(TFT_PWM, pwm);
   } else {
-    ledcWrite(TFT_PWM, BRIGHTNESS_STEPS[brightness]);
+    ledcWrite(TFT_PWM, BRIGHTNESS_STEPS[settings.brightness]);
   }
 }
 
 void loadSettings() {
   prefs.begin("settings", true);
-  isNightMode    = prefs.getBool("nightMode",    false);
-  isCelsius      = prefs.getBool("celsius",      false);
-  isMilitaryTime = prefs.getBool("militaryTime", false);
-  isAutoDim      = prefs.getBool("autoDim",      false);
-  brightness     = prefs.getInt ("brightness",   3);
+  settings.isNightMode    = prefs.getBool("nightMode",    false);
+  settings.isCelsius      = prefs.getBool("celsius",      false);
+  settings.isMilitaryTime = prefs.getBool("militaryTime", false);
+  settings.isAutoDim      = prefs.getBool("autoDim",      false);
+  settings.brightness = prefs.getInt ("brightness",   3);
   prefs.end();
   Serial.println("[NVS] Settings loaded");
 }
 
 void saveSettings() {
   prefs.begin("settings", false);
-  prefs.putBool("nightMode",    isNightMode);
-  prefs.putBool("celsius",      isCelsius);
-  prefs.putBool("militaryTime", isMilitaryTime);
-  prefs.putBool("autoDim",      isAutoDim);
-  prefs.putInt ("brightness",   brightness);
+  prefs.putBool("nightMode",    settings.isNightMode);
+  prefs.putBool("celsius",      settings.isCelsius);
+  prefs.putBool("militaryTime", settings.isMilitaryTime);
+  prefs.putBool("autoDim",      settings.isAutoDim);
+  prefs.putInt ("brightness",   settings.brightness);
   prefs.end();
   Serial.println("[NVS] Settings saved");
 }
@@ -1229,6 +1358,7 @@ void connectToWiFi(String vSSID, String vPASS) {
   tft->fillRect(15, 268, 450, 30, TFT_BLACK);
   tft->fillRect(0, 308, 480, 4, TFT_GREEN);
   tft->fillRect(15, 210, 450, 60, TFT_BLACK);
+  tft->setFont(&FreeMono9pt7b); // match "ESTABLISHING..." above — the hint text uses a smaller font
   tft->setTextColor(TFT_GREEN);
   tft->setCursor(20, 245);
   tft->print("> NEURAL LINK ESTABLISHED");
@@ -1239,7 +1369,7 @@ void connectToWiFi(String vSSID, String vPASS) {
 }
 
 void launchSetupPortal() {
-  showSetupScreen("OmniCore-Setup");
+  showSetupScreen(WIFI_SETUP_AP_NAME);
   WiFiManager wm;
   wm.setTitle("Calloway OS Setup");
 
@@ -1252,403 +1382,16 @@ void launchSetupPortal() {
     p.end();
   });
 
-  if (!wm.startConfigPortal("OmniCore-Setup")) ESP.restart();
+  if (!wm.startConfigPortal(WIFI_SETUP_AP_NAME)) ESP.restart();
   ESP.restart();
 }
 
 // =============================================================================
 // WEB SERVER — serves a live dashboard on the local network at omnicore.local
-// Reads the same g_ globals the display does. Never fetches, never draws.
+// Reads the same sensor readings the display does. Never fetches, never draws.
 // =============================================================================
 
-// Page lives in flash, not RAM. JS polls /data every 2s and patches the DOM,
-// so the page never reloads and never flickers. Graphs load /history once on
-// page open (24hr backlog) then append one new point every 60s from /data —
-// no need to refetch the whole history each time.
-static const char PAGE_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html><head>
-<meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Omni-Core</title>
-<script src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js'></script>
-<style>
-  body{background:#050505;color:#0ff;font-family:'Courier New',monospace;
-       margin:0;padding:20px;}
-  h1{color:#0f0;text-align:center;letter-spacing:3px;margin:0 0 4px;font-size:1.4em;}
-  h2{color:#0ff;text-align:left;letter-spacing:2px;font-size:.85em;
-     text-transform:uppercase;margin:28px 0 10px;max-width:1100px;
-     margin-left:auto;margin-right:auto;border-bottom:1px solid #044;padding-bottom:6px;}
-  .sub{text-align:center;color:#055;font-size:.75em;margin-bottom:24px;}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
-        gap:12px;max-width:800px;margin:0 auto;}
-  .card{background:#0a0a0a;border:1px solid #044;padding:14px;text-align:center;}
-  .card:hover{border-color:#0ff;}
-  .lbl{font-size:.65em;color:#077;text-transform:uppercase;letter-spacing:2px;}
-  .val{font-size:1.7em;font-weight:bold;margin-top:6px;}
-  .unit{font-size:.5em;color:#066;margin-left:3px;}
-  .good{color:#0f0;} .warn{color:#ff0;} .bad{color:#f33;} .neut{color:#0ff;}
-  .foot{text-align:center;color:#044;font-size:.65em;margin-top:24px;}
-  .chartwrap{background:#0a0a0a;border:1px solid #044;padding:16px;
-             max-width:1100px;margin:0 auto 20px;}
-  .chartwrap canvas{max-height:220px;}
-  .loading{text-align:center;color:#044;font-size:.75em;padding:20px;}
-  .rangebar{max-width:1100px;margin:20px auto 4px;display:flex;
-            align-items:center;gap:8px;}
-  .rangelbl{font-size:.65em;color:#077;text-transform:uppercase;
-            letter-spacing:2px;margin-right:4px;}
-  .rangebtn{background:#0a0a0a;border:1px solid #044;color:#077;
-            font-family:'Courier New',monospace;font-size:.7em;
-            letter-spacing:1px;padding:6px 14px;cursor:pointer;
-            text-transform:uppercase;}
-  .rangebtn:hover{border-color:#0ff;color:#0ff;}
-  .rangebtn.active{border-color:#0ff;color:#0ff;background:#001a1a;}
-  .statusbar{text-align:center;margin:4px 0 20px;font-size:.85em;
-             letter-spacing:2px;text-transform:uppercase;font-weight:bold;}
-  .statusbar .dot{display:inline-block;width:9px;height:9px;border-radius:50%;
-                  margin-right:8px;vertical-align:middle;}
-  .statusbar.status-good{color:#0f0;} .statusbar.status-good .dot{background:#0f0;}
-  .statusbar.status-warn{color:#ff0;} .statusbar.status-warn .dot{background:#ff0;}
-  .statusbar.status-bad{color:#f33;}  .statusbar.status-bad .dot{background:#f33;}
-</style></head><body>
-<h1>OMNI-CORE</h1>
-<div class='sub' id='city'>&nbsp;</div>
-<div class='statusbar status-good' id='statusbar'><span class='dot'></span><span id='statustext'>AIR QUALITY: --</span></div>
-<div class='grid'>
-  <div class='card'><div class='lbl'>CO2</div>
-    <div class='val neut' id='co2'>--<span class='unit'>ppm</span></div></div>
-  <div class='card'><div class='lbl'>PM2.5</div>
-    <div class='val neut' id='pm25'>--<span class='unit'>ug/m3</span></div></div>
-  <div class='card'><div class='lbl'>VOC Index</div>
-    <div class='val neut' id='voc'>--</div></div>
-  <div class='card'><div class='lbl'>Temp</div>
-    <div class='val neut' id='temp'>--<span class='unit'>F</span></div></div>
-  <div class='card'><div class='lbl'>Humidity</div>
-    <div class='val neut' id='hum'>--<span class='unit'>%</span></div></div>
-  <div class='card'><div class='lbl'>Light</div>
-    <div class='val neut' id='lux'>--<span class='unit'>lux</span></div></div>
-  <div class='card'><div class='lbl'>PM1</div>
-    <div class='val neut' id='pm1'>--</div></div>
-  <div class='card'><div class='lbl'>PM4</div>
-    <div class='val neut' id='pm4'>--</div></div>
-  <div class='card'><div class='lbl'>PM10</div>
-    <div class='val neut' id='pm10'>--</div></div>
-</div>
-
-<div class='rangebar'>
-  <span class='rangelbl'>Range:</span>
-  <button class='rangebtn' data-hours='1'>1H</button>
-  <button class='rangebtn' data-hours='6'>6H</button>
-  <button class='rangebtn' data-hours='12'>12H</button>
-  <button class='rangebtn active' data-hours='24'>24H</button>
-</div>
-
-<h2 id='hdrCO2'>CO2 &middot; Last 24 Hours</h2>
-<div class='chartwrap'><canvas id='chartCO2'></canvas></div>
-
-<h2 id='hdrPM'>Particulate Matter (ug/m3) &middot; Last 24 Hours</h2>
-<div class='chartwrap'><canvas id='chartPM'></canvas></div>
-
-<h2 id='hdrVOC'>VOC Index &middot; Last 24 Hours</h2>
-<div class='chartwrap'><canvas id='chartVOC'></canvas></div>
-
-<h2 id='hdrTemp'>Temperature (F) &middot; Last 24 Hours</h2>
-<div class='chartwrap'><canvas id='chartTemp'></canvas></div>
-
-<h2 id='hdrHum'>Humidity (%) &middot; Last 24 Hours</h2>
-<div class='chartwrap'><canvas id='chartHum'></canvas></div>
-
-<div class='foot'>CALLOWAY OS &middot; live &middot; cards update every 2s &middot; graphs every 60s</div>
-<script>
-function cls(el,c){el.className='val '+c;}
-
-function tick(){
-  fetch('/data').then(r=>r.json()).then(d=>{
-    let co2=document.getElementById('co2');
-    co2.innerHTML=d.co2+"<span class='unit'>ppm</span>";
-    cls(co2, d.co2<800?'good':d.co2<1200?'warn':'bad');
-
-    let pm=document.getElementById('pm25');
-    pm.innerHTML=d.pm25.toFixed(1)+"<span class='unit'>ug/m3</span>";
-    cls(pm, d.pm25<12?'good':d.pm25<35?'warn':'bad');
-
-    document.getElementById('voc').textContent  = d.voc;
-    document.getElementById('pm1').textContent  = d.pm1.toFixed(1);
-    document.getElementById('pm4').textContent  = d.pm4.toFixed(1);
-    document.getElementById('pm10').textContent = d.pm10.toFixed(1);
-    document.getElementById('temp').innerHTML   = d.temp.toFixed(1)+"<span class='unit'>F</span>";
-    document.getElementById('hum').innerHTML    = d.hum.toFixed(0)+"<span class='unit'>%</span>";
-    document.getElementById('lux').innerHTML    = d.lux.toFixed(0)+"<span class='unit'>lux</span>";
-    document.getElementById('city').textContent = d.city;
-
-    // Overall status banner — worst of CO2/PM2.5 bands, same thresholds as
-    // the live cards and charts above. VOC has no widely-agreed thresholds
-    // so it doesn't drive this verdict; temp/humidity are comfort metrics,
-    // not air-quality/health ones, so they're left out too.
-    const co2Band = d.co2 < 800 ? 0 : d.co2 < 1200 ? 1 : 2;
-    const pmBand  = d.pm25 < 12 ? 0 : d.pm25 < 35 ? 1 : 2;
-    const worst = Math.max(co2Band, pmBand);
-    const statusbar = document.getElementById('statusbar');
-    const statustext = document.getElementById('statustext');
-    if (worst === 0) {
-      statusbar.className = 'statusbar status-good';
-      statustext.textContent = 'AIR QUALITY: GOOD';
-    } else if (worst === 1) {
-      statusbar.className = 'statusbar status-warn';
-      statustext.textContent = 'AIR QUALITY: ELEVATED';
-    } else {
-      statusbar.className = 'statusbar status-bad';
-      statustext.textContent = 'AIR QUALITY: POOR';
-    }
-  }).catch(e=>{});
-}
-
-// Live cards start immediately, independent of whether Chart.js loaded.
-// If the CDN is unreachable this is the one thing that must keep working.
-tick();
-setInterval(tick, 2000);
-
-// ---- Chart setup -----------------------------------------------------
-// Everything below only runs if Chart.js actually loaded from the CDN.
-// If the CDN was blocked or unreachable, the charts are skipped entirely
-// and the boxes show a message instead — the live cards above are
-// unaffected either way since they're wired up before this check runs.
-if (typeof Chart === 'undefined') {
-  document.querySelectorAll('.chartwrap').forEach(el=>{
-    el.innerHTML = "<div class='loading'>Chart library failed to load — check network access or the CDN URL/version in main.cpp</div>";
-  });
-} else {
-
-// Threshold bands mirror the same breakpoints used on the TFT and the
-// live cards: CO2 good/warn/bad at 800/1200ppm, PM2.5 at 12/35 ug/m3.
-Chart.defaults.color = '#077';
-Chart.defaults.borderColor = '#044';
-Chart.defaults.font.family = "'Courier New', monospace";
-
-function fmtTime(epochSec){
-  const d = new Date(epochSec * 1000);
-  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-}
-
-
-// Colors a line by segment based on value thresholds, so the line itself
-// shifts green/yellow/red as it crosses bands rather than one flat color.
-function bandColor(value, goodMax, warnMax){
-  if (value < goodMax) return '#0f0';
-  if (value < warnMax) return '#ff0';
-  return '#f33';
-}
-function segmentColorFn(chart, goodMax, warnMax){
-  return (ctx) => {
-    const v = ctx.p1?.parsed?.y ?? ctx.p0?.parsed?.y ?? 0;
-    return bandColor(v, goodMax, warnMax);
-  };
-}
-
-let chartCO2, chartPM, chartTemp, chartHum, chartVOC;
-
-function buildCharts(labels, co2Data, pm1Data, pm25Data, pm4Data, pm10Data, tempData, humData, vocData){
-  const commonScales = {
-    x: { ticks: { maxTicksLimit: 8, color:'#077' }, grid:{ color:'#022' } },
-    y: { ticks: { color:'#077' }, grid:{ color:'#022' } }
-  };
-
-  chartCO2 = new Chart(document.getElementById('chartCO2'), {
-    type: 'line',
-    data: { labels, datasets: [{
-      label: 'CO2 (ppm)', data: co2Data,
-      borderWidth: 2, pointRadius: 0, tension: 0.25,
-      segment: { borderColor: ctx => segmentColorFn(chartCO2, 800, 1200)(ctx) }
-    }]},
-    options: {
-      responsive: true, animation: false,
-      plugins: { legend: { display:false } },
-      scales: commonScales
-    }
-  });
-
-  chartPM = new Chart(document.getElementById('chartPM'), {
-    type: 'line',
-    data: { labels, datasets: [
-      { label:'PM1',   data: pm1Data,  borderColor:'#066', borderWidth:1, pointRadius:0, tension:0.25 },
-      { label:'PM2.5', data: pm25Data, borderWidth:2, pointRadius:0, tension:0.25,
-        segment:{ borderColor: ctx => segmentColorFn(chartPM, 12, 35)(ctx) } },
-      { label:'PM4',   data: pm4Data,  borderColor:'#088', borderWidth:1, pointRadius:0, tension:0.25 },
-      { label:'PM10',  data: pm10Data, borderColor:'#0aa', borderWidth:1, pointRadius:0, tension:0.25 }
-    ]},
-    options: {
-      responsive: true, animation: false,
-      plugins: { legend: { display:true, labels:{ boxWidth:12, font:{size:10} } } },
-      scales: commonScales
-    }
-  });
-
-  chartTemp = new Chart(document.getElementById('chartTemp'), {
-    type: 'line',
-    data: { labels, datasets: [{
-      label: 'Temp (F)', data: tempData,
-      borderColor: '#0ff', borderWidth: 2, pointRadius: 0, tension: 0.25
-    }]},
-    options: {
-      responsive: true, animation: false,
-      plugins: { legend: { display:false } },
-      scales: commonScales
-    }
-  });
-
-  chartHum = new Chart(document.getElementById('chartHum'), {
-    type: 'line',
-    data: { labels, datasets: [{
-      label: 'Humidity (%)', data: humData,
-      borderColor: '#0ff', borderWidth: 2, pointRadius: 0, tension: 0.25
-    }]},
-    options: {
-      responsive: true, animation: false,
-      plugins: { legend: { display:false } },
-      scales: commonScales
-    }
-  });
-
-  // VOC index has no official EPA-style bands like CO2/PM2.5 — the sensor's
-  // own baseline is ~100, so it's shown as a plain neutral line rather than
-  // threshold-colored.
-  chartVOC = new Chart(document.getElementById('chartVOC'), {
-    type: 'line',
-    data: { labels, datasets: [{
-      label: 'VOC Index', data: vocData,
-      borderColor: '#0ff', borderWidth: 2, pointRadius: 0, tension: 0.25
-    }]},
-    options: {
-      responsive: true, animation: false,
-      plugins: { legend: { display:false } },
-      scales: commonScales
-    }
-  });
-}
-
-// Loads (or re-loads) the full history buffer from the device and syncs it
-// into the charts. Called once on page open, then again on a timer.
-//
-// IMPORTANT: this is the ONLY thing that ever writes chart data. There is no
-// separate "append a new point every 60s" timer running independently in the
-// browser. Two independent clocks — the device's own 60s sample timer, and a
-// browser-side timer trying to guess when a new point should appear — will
-// always drift apart, since they start counting from different moments (the
-// device from boot, the browser from page load) and neither can see the
-// other's schedule. That drift is what caused labels/lines to desync the
-// longer a page stayed open without a refresh: the browser was inventing its
-// own points on its own schedule instead of asking the device what it
-// actually recorded. Re-fetching the device's real /history buffer and
-// resyncing to it — rather than layering a separate JS-side guess on top —
-// removes the second clock entirely, so there's nothing left to drift.
-// Currently selected range, in hours. 24 = show everything the device has.
-let selectedRangeHours = 24;
-
-// The full set of points last fetched from the device — cached so switching
-// ranges just re-slices this in memory, no need to refetch from the device.
-let latestPoints = null;
-
-const rangeHeaders = {
-  co2: 'CO2', pm: 'Particulate Matter (ug/m3)', voc: 'VOC Index',
-  temp: 'Temperature (F)', hum: 'Humidity (%)'
-};
-function rangeLabel(hours){
-  return hours === 24 ? 'Last 24 Hours' : `Last ${hours} Hour${hours === 1 ? '' : 's'}`;
-}
-function updateHeaders(hours){
-  document.getElementById('hdrCO2').textContent  = `${rangeHeaders.co2} \u00b7 ${rangeLabel(hours)}`;
-  document.getElementById('hdrPM').textContent   = `${rangeHeaders.pm} \u00b7 ${rangeLabel(hours)}`;
-  document.getElementById('hdrVOC').textContent  = `${rangeHeaders.voc} \u00b7 ${rangeLabel(hours)}`;
-  document.getElementById('hdrTemp').textContent = `${rangeHeaders.temp} \u00b7 ${rangeLabel(hours)}`;
-  document.getElementById('hdrHum').textContent  = `${rangeHeaders.hum} \u00b7 ${rangeLabel(hours)}`;
-}
-
-// Slices the cached full-history array down to the last N hours. Points are
-// sampled once per minute on the device, so N hours = N*60 most recent points.
-function sliceToRange(points, hours){
-  if (hours >= 24) return points; // 24h = everything the device has
-  const count = hours * 60;
-  return points.length > count ? points.slice(-count) : points;
-}
-
-function renderFromCache(){
-  if (!latestPoints) return;
-  const points = sliceToRange(latestPoints, selectedRangeHours);
-
-  const labels   = points.map(p => fmtTime(p.t));
-  const co2Data  = points.map(p => p.co2);
-  const pm1Data  = points.map(p => p.pm1);
-  const pm25Data = points.map(p => p.pm25);
-  const pm4Data  = points.map(p => p.pm4);
-  const pm10Data = points.map(p => p.pm10);
-  const tempData = points.map(p => p.temp);
-  const humData  = points.map(p => p.hum);
-  const vocData  = points.map(p => p.voc);
-
-  updateHeaders(selectedRangeHours);
-
-  if (!chartCO2) {
-    buildCharts(labels, co2Data, pm1Data, pm25Data, pm4Data, pm10Data, tempData, humData, vocData);
-    return;
-  }
-
-  chartCO2.data.labels = labels;
-  chartCO2.data.datasets[0].data = co2Data;
-
-  chartPM.data.labels = labels;
-  chartPM.data.datasets[0].data = pm1Data;
-  chartPM.data.datasets[1].data = pm25Data;
-  chartPM.data.datasets[2].data = pm4Data;
-  chartPM.data.datasets[3].data = pm10Data;
-
-  chartTemp.data.labels = labels;
-  chartTemp.data.datasets[0].data = tempData;
-
-  chartHum.data.labels = labels;
-  chartHum.data.datasets[0].data = humData;
-
-  chartVOC.data.labels = labels;
-  chartVOC.data.datasets[0].data = vocData;
-
-  [chartCO2, chartPM, chartTemp, chartHum, chartVOC].forEach(ch => ch.update('none'));
-}
-
-// Fetches the device's full history buffer and caches it, then renders
-// whatever range is currently selected. This is the ONLY thing that ever
-// fetches from the device — switching ranges afterward just re-slices the
-// cached array, no new fetch needed. See the note above loadHistory's
-// previous version: never invent points client-side, only ever display
-// exactly what the device's own buffer reports.
-function loadHistory(isFirstLoad){
-  fetch('/history').then(r=>r.json()).then(points=>{
-    latestPoints = points;
-    renderFromCache();
-  }).catch(e=>{
-    if (isFirstLoad) {
-      document.querySelectorAll('.chartwrap').forEach(el=>{
-        el.innerHTML = "<div class='loading'>History unavailable</div>";
-      });
-    }
-    // On a resync failure (not first load), just skip this cycle and leave
-    // the charts showing the last-known-good data — don't blank them out
-    // over one missed fetch.
-  });
-}
-
-document.querySelectorAll('.rangebtn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.rangebtn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    selectedRangeHours = parseInt(btn.dataset.hours, 10);
-    renderFromCache(); // instant — no fetch needed, just re-slice cached data
-  });
-});
-
-loadHistory(true);
-setInterval(() => loadHistory(false), 60000); // resync from the device's real buffer every 60s
-
-} // end Chart-availability guard
-</script></body></html>
-)HTML";
+#include "webpage.h" // PAGE_HTML — the dashboard's HTML/CSS/JS, kept out of this file for readability
 
 void handleRoot() {
   server.send_P(200, "text/html", PAGE_HTML);
@@ -1661,8 +1404,8 @@ void handleData() {
   snprintf(json, sizeof(json),
     "{\"co2\":%u,\"pm1\":%.1f,\"pm25\":%.1f,\"pm4\":%.1f,\"pm10\":%.1f,"
     "\"voc\":%.0f,\"temp\":%.1f,\"hum\":%.1f,\"lux\":%.1f,\"city\":\"%s\"}",
-    g_co2, g_pm1, g_pm25, g_pm4, g_pm10, g_voc,
-    g_localTemp, g_humidity, g_lux,
+    sensors.co2, sensors.pm1, sensors.pm25, sensors.pm4, sensors.pm10, sensors.voc,
+    sensors.localTemp, sensors.humidity, sensors.lux,
     currentCity.substring(0, currentCity.indexOf(',')).c_str());
   server.send(200, "application/json", json);
 }
@@ -1738,7 +1481,7 @@ bool fetchWeather() {
         if (h > g_tempHigh) g_tempHigh = h;
         if (l < g_tempLow)  g_tempLow  = l;
       }
-      hasWeatherData = true;
+      ui.hasWeatherData = true;
       success = true;
     }
     http.end();
@@ -1773,10 +1516,10 @@ void updateLocalSensors() {
   uint16_t ir   = lum >> 16;
   uint16_t full = lum & 0xFFFF;
   if (full == 0 && ir == 0) {
-    g_lux = 0;
+    sensors.lux = 0;
   } else {
     float lux = tsl.calculateLux(full, ir);
-    g_lux = (isnan(lux) || lux < 0 || lux > 88000) ? 0 : lux;
+    sensors.lux = (isnan(lux) || lux < 0 || lux > 88000) ? 0 : lux;
   }
 
   // SCD40 — only reads when sensor signals new data is ready
@@ -1787,10 +1530,10 @@ void updateLocalSensors() {
   if (dataReady) {
     uint16_t error = scd4x.readMeasurement(co2, temp, hum);
     if (!error && co2 != 0) {
-      g_co2        = co2;
-      g_localTemp  = temp * 9.0 / 5.0 + 32.0; // store as Fahrenheit
-      g_humidity   = hum;
-      hasSCD40Data = true;
+      sensors.co2        = co2;
+      sensors.localTemp  = temp * 9.0 / 5.0 + 32.0; // store as Fahrenheit
+      sensors.humidity   = hum;
+      sensors.scd40Valid = true;
     }
   }
 
@@ -1806,19 +1549,19 @@ void updateLocalSensors() {
                                senHum, senTemp, senVoc, senNox) == 0) {
     // fan needs ~30s before PM values are meaningful — reject NaN until then
     if (!isnan(senPm25) && !isnan(senVoc)) {
-      g_pm1        = senPm1;
-      g_pm25       = senPm25;
-      g_pm4        = senPm4;
-      g_pm10       = senPm10;
-      g_voc        = senVoc;
-      hasSEN54Data = true;
+      sensors.pm1        = senPm1;
+      sensors.pm25       = senPm25;
+      sensors.pm4        = senPm4;
+      sensors.pm10       = senPm10;
+      sensors.voc        = senVoc;
+      sensors.sen54Valid = true;
     }
   }
 
   Serial.printf("[LUX] %.1f  [CO2] %d ppm  [TEMP] %.1fF  [HUM] %.1f%%  "
                 "[PM1] %.1f  [PM2.5] %.1f  [PM4] %.1f  [PM10] %.1f  [VOC] %.0f\n",
-                g_lux, g_co2, g_localTemp, g_humidity,
-                g_pm1, g_pm25, g_pm4, g_pm10, g_voc);
+                sensors.lux, sensors.co2, sensors.localTemp, sensors.humidity,
+                sensors.pm1, sensors.pm25, sensors.pm4, sensors.pm10, sensors.voc);
 }
 
 // =============================================================================
