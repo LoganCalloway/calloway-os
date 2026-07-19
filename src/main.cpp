@@ -270,16 +270,12 @@ Settings settings;
 // =============================================================================
 // UI STATE — resets every boot, never touches flash.
 // =============================================================================
-struct UiState {
-  int  lastMin = -1, lastSec = -1;     // dirty bits — only redraw when changed
-  bool hasWeatherData       = false;   // gates weather display until first fetch
-  bool menuOpen             = false;
-  bool brightnessSliderOpen = false;
-  bool awaitingResetConfirm = false;
-  int  menuOffset           = 0;       // first visible menu item index
-};
-
-UiState ui;
+int  lastMin = -1, lastSec = -1;    // dirty bits — only redraw when changed
+bool hasWeatherData       = false;  // gates weather display until first fetch
+bool menuOpen             = false;
+bool brightnessSliderOpen = false;
+bool awaitingResetConfirm = false;
+int  menuOffset           = 0;      // first visible menu item index
 
 // Touch state — start position only, last position unreliable on FT6236 lift
 struct TouchState {
@@ -610,20 +606,20 @@ void loop() {
 
   if (currentMillis - lastClockTime >= clockInterval) {
     checkWiFiHealth();
-    if (!ui.menuOpen) updateTimeDisplay();
+    if (!menuOpen) updateTimeDisplay();
     checkDaylightSavings();
     lastClockTime = currentMillis;
   }
 
   if (currentMillis - lastWifiIconTime >= wifiIconInterval) {
-    if (!ui.menuOpen) drawWiFiIcon();
+    if (!menuOpen) drawWiFiIcon();
     lastWifiIconTime = currentMillis;
   }
 
   if (currentMillis - lastSensorTime >= sensorInterval) {
     updateLocalSensors();
     applyBrightness();
-    if (!ui.menuOpen) updateSensorDisplay();
+    if (!menuOpen) updateSensorDisplay();
     lastSensorTime = currentMillis;
   }
 
@@ -636,7 +632,7 @@ void loop() {
 
     if (currentMillis - lastWeatherTime >= weatherInterval || lastWeatherTime == 0) {
       if (fetchWeather()) {
-        if (!ui.menuOpen) updateWeatherDisplay();
+        if (!menuOpen) updateWeatherDisplay();
       } else {
         Serial.println("[Weather] Fetch failed — retry in 15min");
       }
@@ -678,15 +674,15 @@ void checkTouch() {
       // process as tap if short touch and not too soon after last tap
       if (holdTime > 10 && holdTime < 500 && millis() - touchState.lastTap > 400) {
         touchState.lastTap = millis();
-        if (ui.awaitingResetConfirm) {
+        if (awaitingResetConfirm) {
           handleResetConfirmTouch(touchState.startX, touchState.startY);
-        } else if (ui.brightnessSliderOpen) {
+        } else if (brightnessSliderOpen) {
           if (touchState.startY < SLIDER_Y - 40 || touchState.startY > SLIDER_Y + 60) {
-            ui.brightnessSliderOpen = false;
+            brightnessSliderOpen = false;
             saveSettings();
             drawMenu();
           }
-        } else if (ui.menuOpen) {
+        } else if (menuOpen) {
           handleMenuTouch(touchState.startX, touchState.startY);
         } else {
           openMenu();
@@ -707,7 +703,7 @@ void checkTouch() {
     touchState.startTime = millis();
   }
 
-  if (ui.brightnessSliderOpen) {
+  if (brightnessSliderOpen) {
     handleSliderTouch(x, y);
   }
 }
@@ -729,8 +725,8 @@ void handleMenuTouch(int x, int y) {
   // up arrow button — same rect drawMenu() draws it with
   if (x > MENU_SCROLL_UP_X && x < MENU_SCROLL_UP_X + MENU_SCROLL_BTN_W &&
       y > MENU_SCROLL_Y && y < MENU_SCROLL_Y + MENU_SCROLL_H) {
-    if (ui.menuOffset > 0) {
-      ui.menuOffset--;
+    if (menuOffset > 0) {
+      menuOffset--;
       drawMenu();
     }
     return;
@@ -739,8 +735,8 @@ void handleMenuTouch(int x, int y) {
   // down arrow button — same rect drawMenu() draws it with
   if (x > MENU_SCROLL_DOWN_X && x < MENU_SCROLL_DOWN_X + MENU_SCROLL_BTN_W &&
       y > MENU_SCROLL_Y && y < MENU_SCROLL_Y + MENU_SCROLL_H) {
-    if (ui.menuOffset + MENU_VISIBLE < MENU_ITEM_COUNT) {
-      ui.menuOffset++;
+    if (menuOffset + MENU_VISIBLE < MENU_ITEM_COUNT) {
+      menuOffset++;
       drawMenu();
     }
     return;
@@ -748,7 +744,7 @@ void handleMenuTouch(int x, int y) {
 
   // check which item row was tapped
   for (int i = 0; i < MENU_VISIBLE; i++) {
-    int itemIdx    = i + ui.menuOffset;
+    int itemIdx    = i + menuOffset;
     if (itemIdx >= MENU_ITEM_COUNT) break;
     int itemTop    = MENU_FIRST_Y - 18 + (i * MENU_ITEM_H);
     int itemBottom = itemTop + MENU_ITEM_H;
@@ -763,7 +759,7 @@ void handleResetConfirmTouch(int x, int y) {
   // YES button — same rect drawResetConfirm() draws it with
   if (x > RESET_YES_X && x < RESET_YES_X + RESET_BTN_W &&
       y > RESET_BTN_Y && y < RESET_BTN_Y + RESET_BTN_H) {
-    ui.awaitingResetConfirm = false;
+    awaitingResetConfirm = false;
     prefs.begin("wifi-gate", false); prefs.clear(); prefs.end();
     prefs.begin("settings",  false); prefs.clear(); prefs.end();
     WiFiManager wm; wm.resetSettings();
@@ -774,7 +770,7 @@ void handleResetConfirmTouch(int x, int y) {
   // NO button — same rect drawResetConfirm() draws it with
   if (x > RESET_NO_X && x < RESET_NO_X + RESET_BTN_W &&
       y > RESET_BTN_Y && y < RESET_BTN_Y + RESET_BTN_H) {
-    ui.awaitingResetConfirm = false;
+    awaitingResetConfirm = false;
     drawMenu();
   }
 }
@@ -804,20 +800,20 @@ void handleSliderTouch(int x, int y) {
 // =============================================================================
 
 void openMenu() {
-  ui.menuOpen             = true;
-  ui.brightnessSliderOpen = false;
-  ui.awaitingResetConfirm = false;
-  ui.menuOffset           = 0;
+  menuOpen             = true;
+  brightnessSliderOpen = false;
+  awaitingResetConfirm = false;
+  menuOffset           = 0;
   drawMenu();
 }
 
 void closeMenu() {
-  ui.menuOpen             = false;
-  ui.brightnessSliderOpen = false;
-  ui.awaitingResetConfirm = false;
+  menuOpen             = false;
+  brightnessSliderOpen = false;
+  awaitingResetConfirm = false;
   tft->fillScreen(TFT_BLACK);
-  ui.lastMin = -1;
-  ui.lastSec = -1; // force full dashboard redraw
+  lastMin = -1;
+  lastSec = -1; // force full dashboard redraw
   updateTimeDisplay();
   updateWeatherDisplay();
   updateSensorDisplay();
@@ -845,7 +841,7 @@ void selectMenuItem(int itemIdx) {
       break;
 
     case 3: // Brightness — open slider
-      ui.brightnessSliderOpen = true;
+      brightnessSliderOpen = true;
       drawBrightnessSlider();
       break;
 
@@ -857,7 +853,7 @@ void selectMenuItem(int itemIdx) {
       break;
 
     case 5: // Reset WiFi
-      ui.awaitingResetConfirm = true;
+      awaitingResetConfirm = true;
       drawResetConfirm();
       break;
 
@@ -872,7 +868,7 @@ void drawScrollbar() {
   const int trackX = 450, trackY = 78, trackH = 190;
 
   int thumbH = (MENU_VISIBLE * trackH) / MENU_ITEM_COUNT;
-  int thumbY = trackY + (ui.menuOffset * trackH) / MENU_ITEM_COUNT;
+  int thumbY = trackY + (menuOffset * trackH) / MENU_ITEM_COUNT;
 
   tft->fillRect(trackX, trackY, 4, trackH, col.menuControlBg);
   tft->fillRect(trackX, thumbY, 4, thumbH, col.menuAccent);
@@ -899,7 +895,7 @@ void drawMenu() {
   tft->print("X");
 
   for (int i = 0; i < MENU_VISIBLE; i++) {
-    int itemIdx = i + ui.menuOffset;
+    int itemIdx = i + menuOffset;
     if (itemIdx >= MENU_ITEM_COUNT) break;
     int itemY = MENU_FIRST_Y + (i * MENU_ITEM_H);
 
@@ -1022,9 +1018,9 @@ void updateTimeDisplay() {
 
   ColorPalette col = getColorPalette();
 
-  if (timeinfo.tm_sec != ui.lastSec) {
+  if (timeinfo.tm_sec != lastSec) {
 
-    if (timeinfo.tm_min != ui.lastMin) {
+    if (timeinfo.tm_min != lastMin) {
       char dateBuf[25];
       strftime(dateBuf, 25, "%A, %b %d", &timeinfo);
 
@@ -1036,7 +1032,7 @@ void updateTimeDisplay() {
 
       tft->draw16bitRGBBitmap(60, 156, dateCanvas.getBuffer(), 320, 24);
       tft->drawFastHLine(60, DIVIDER_Y, 320, col.line);
-      ui.lastMin = timeinfo.tm_min;
+      lastMin = timeinfo.tm_min;
     }
 
     clockCanvas.fillScreen(TFT_BLACK);
@@ -1058,12 +1054,12 @@ void updateTimeDisplay() {
     }
 
     tft->draw16bitRGBBitmap(CLOCK_X, CLOCK_Y, clockCanvas.getBuffer(), 420, 65);
-    ui.lastSec = timeinfo.tm_sec;
+    lastSec = timeinfo.tm_sec;
   }
 }
 
 void updateWeatherDisplay() {
-  if (!ui.hasWeatherData) return;
+  if (!hasWeatherData) return;
 
   ColorPalette col = getColorPalette();
 
@@ -1481,7 +1477,7 @@ bool fetchWeather() {
         if (h > g_tempHigh) g_tempHigh = h;
         if (l < g_tempLow)  g_tempLow  = l;
       }
-      ui.hasWeatherData = true;
+      hasWeatherData = true;
       success = true;
     }
     http.end();
