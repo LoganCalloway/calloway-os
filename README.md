@@ -41,6 +41,12 @@ WiFi credentials aren't hardcoded — the device runs a WiFiManager captive port
 
 A full project report — hardware design, PCB and enclosure details, software architecture, and development history — is available at `docs/Calloway_OS_Report.pdf`.
 
+## Acknowledgments
+
+- PCB designed in EasyEDA Standard, fabricated and assembled by JLCPCB
+- Enclosure modeled in SolidWorks, 3D printed
+- Firmware development assisted by Claude Code
+
 ## License
 
 Copyright © 2025–2026 Logan Calloway. All rights reserved. See individual source file headers for details.
