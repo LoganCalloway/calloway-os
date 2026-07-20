@@ -39,7 +39,7 @@ WiFi credentials aren't hardcoded — the device runs a WiFiManager captive port
 
 ## Project Report
 
-A full project report — hardware design, PCB and enclosure details, software architecture, and development history — is available at `docs/Calloway_OS_Report.pdf`.
+A full project report — hardware design, PCB and enclosure details, software architecture, and development history — is available at [docs/Calloway_OS_Report.pdf](docs/Calloway_OS_Report.pdf).
 
 ## Acknowledgments
 
