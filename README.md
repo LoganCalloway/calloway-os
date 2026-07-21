@@ -43,7 +43,7 @@ A full project report — hardware design, PCB and enclosure details, software a
 
 ## Acknowledgments
 
-- PCB designed in EasyEDA Standard, fabricated and assembled by JLCPCB
+- PCB designed in EasyEDA Standard, fabricated by JLCPCB, hand-assembled
 - Enclosure modeled in SolidWorks, 3D printed
 - Firmware development assisted by Claude Code
 
