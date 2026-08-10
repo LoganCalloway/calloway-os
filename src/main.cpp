@@ -54,6 +54,7 @@
 #include <WiFiManager.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 
 #include <Fonts/FreeSansBold24pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -96,6 +97,7 @@
 const char* weatherKey  = WEATHER_API_KEY;
 String currentCity      = "Asheville,US";   // updated by syncLocationAndTime()
 long   currentUtcOffset = -14400;           // updated by syncLocationAndTime()
+String lastResetReason  = "Unknown";        // read once at boot — cause of the previous restart
 
 // =============================================================================
 // PIN MAPPING
@@ -168,7 +170,7 @@ long   currentUtcOffset = -14400;           // updated by syncLocationAndTime()
 #define MENU_Y          40
 #define MENU_W         440
 #define MENU_H         240
-#define MENU_ITEM_COUNT   7  // Night Mode, Temp Unit, Military Time, Brightness, Auto Dim, Reset WiFi, Close
+#define MENU_ITEM_COUNT  10  // Night Mode, Temp Unit, Military Time, Brightness, Auto Dim, IP Address, Last Reset, Version, Reset WiFi, Close
 #define MENU_VISIBLE      5  // rows shown at once; scroll arrows page through the rest
 #define MENU_ITEM_H     35
 #define MENU_FIRST_Y   105  // Y baseline of first menu item
@@ -224,6 +226,7 @@ const long sensorInterval   =   1000;   // 1s    — sensor poll
 const long weatherInterval  = 900000;   // 15min — weather fetch
 const long ntpInterval      = 3600000;  // 1hr   — NTP resync
 const long historyInterval  =  60000;   // 60s   — history sample for web graphs
+const long scd40StaleTimeout = 120000;  // 2min  — recover SCD40 if it stops reporting data
 
 unsigned long lastClockTime    = 0;
 unsigned long lastWifiIconTime = 0;
@@ -490,11 +493,30 @@ void handleHistory();
 void startWebServer();
 void sampleHistory();
 
+// Human-readable cause of the previous restart — read once at boot, since the
+// reason lives in a register that gets overwritten by the next reset.
+String describeResetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "Power On";
+    case ESP_RST_EXT:       return "External";        // reset button / reset pin pulled low
+    case ESP_RST_SW:        return "Software";       // e.g. our own ESP.restart() calls
+    case ESP_RST_PANIC:     return "Crash";
+    case ESP_RST_INT_WDT:   return "Watchdog (Int)";
+    case ESP_RST_TASK_WDT:  return "Watchdog (Task)"; // our armed task watchdog fired
+    case ESP_RST_WDT:       return "Watchdog";
+    case ESP_RST_BROWNOUT:  return "Brownout";         // supply voltage dipped too low
+    case ESP_RST_DEEPSLEEP: return "Deep Sleep";
+    default:                return "Unknown";
+  }
+}
+
 // =============================================================================
 // SETUP
 // =============================================================================
 void setup() {
   Serial.begin(115200);
+  lastResetReason = describeResetReason();
+  Serial.printf("[BOOT] Last reset reason: %s\n", lastResetReason.c_str());
 
   // Backlight PWM — direct drive to display LED pin, higher = brighter
   ledcAttach(TFT_PWM, 5000, 8);
@@ -852,12 +874,21 @@ void selectMenuItem(int itemIdx) {
       drawMenu();
       break;
 
-    case 5: // Reset WiFi
+    case 5: // IP Address — informational only, nothing to select
+      break;
+
+    case 6: // Last Reset — informational only, nothing to select
+      break;
+
+    case 7: // Version — informational only, nothing to select
+      break;
+
+    case 8: // Reset WiFi
       awaitingResetConfirm = true;
       drawResetConfirm();
       break;
 
-    case 6: // Close
+    case 9: // Close
       closeMenu();
       break;
   }
@@ -878,7 +909,7 @@ void drawMenu() {
   ColorPalette col = getColorPalette();
   const char* items[] = {
     "Night Mode", "Temp Unit", "Military Time",
-    "Brightness", "Auto Dim", "Reset WiFi", "Close"
+    "Brightness", "Auto Dim", "IP Address", "Last Reset", "Version", "Reset WiFi", "Close"
   };
 
   tft->fillRoundRect(MENU_X, MENU_Y, MENU_W, MENU_H, 8, col.menuPanelBg);
@@ -914,6 +945,18 @@ void drawMenu() {
       tft->printf("%d%%", pct);
     }
     if (itemIdx == 4) tft->print(settings.isAutoDim ? "ON" : "OFF");
+    if (itemIdx == 5) {
+      tft->setCursor(150, itemY); // longer than the other values — starts earlier
+      tft->print(WiFi.localIP().toString());
+    }
+    if (itemIdx == 6) {
+      tft->setCursor(220, itemY);
+      tft->print(lastResetReason);
+    }
+    if (itemIdx == 7) {
+      tft->setCursor(180, itemY); // longer than the other values — starts earlier
+      tft->print(OS_VERSION);
+    }
 
     tft->setTextColor(col.menuDimText);
     tft->setCursor(420, itemY);
@@ -1519,6 +1562,7 @@ void updateLocalSensors() {
   }
 
   // SCD40 — only reads when sensor signals new data is ready
+  static unsigned long lastScd40ReadMillis = 0; // last time a valid reading came in
   uint16_t co2;
   float    temp, hum;
   bool     dataReady = false;
@@ -1530,7 +1574,19 @@ void updateLocalSensors() {
       sensors.localTemp  = temp * 9.0 / 5.0 + 32.0; // store as Fahrenheit
       sensors.humidity   = hum;
       sensors.scd40Valid = true;
+      lastScd40ReadMillis = millis();
     }
+  }
+
+  // Recover from a stuck SCD40 — if it's gone too long without a valid
+  // reading, restart its measurement cycle rather than waiting on a hang
+  // that never trips the watchdog (the bus keeps responding, it just stops
+  // reporting fresh data).
+  if (millis() - lastScd40ReadMillis > scd40StaleTimeout) {
+    Serial.println("[SCD40] No valid reading in 2min — restarting measurement cycle");
+    scd4x.stopPeriodicMeasurement();
+    scd4x.startPeriodicMeasurement();
+    lastScd40ReadMillis = millis(); // give it a fresh window before checking again
   }
 
   // SEN54 — particulates and VOC index.
