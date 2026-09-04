@@ -41,6 +41,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
@@ -481,6 +482,11 @@ void drawBrightnessSlider();
 void drawResetConfirm();
 bool fetchWeather();
 bool syncLocationAndTime();
+bool syncLocationByCityOverride(const String &cityName);
+bool tryGeocodeQuery(HTTPClient &http, WiFiClientSecure &secureClient,
+                      const String &query, float &lat, float &lon,
+                      String &resolvedCity, String &resolvedCountry);
+String urlEncodeCityName(const String &input);
 void updateLocalSensors();
 void updateTimeDisplay();
 void updateWeatherDisplay();
@@ -1414,10 +1420,24 @@ void launchSetupPortal() {
 
   wm.setCustomHeadElement("<style>body { background-color: #050505; color: #00FFFF; font-family: 'Courier New', monospace; margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }.wrap { background: #0a0a0a; border: 2px solid #00FFFF; padding: 40px; box-shadow: 0 0 20px #00FFFF; width: 95% !important; max-width: 800px !important; }@media (min-width: 768px) {form { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; }form div { width: 48%; }button { width: 100% !important; margin-top: 20px; }h1 { width: 100%; }}a { color: #00FFFF; text-decoration: none; font-weight: bold; padding: 12px; display: block; border-bottom: 1px solid #111; width: 100%; box-sizing: border-box; }a:hover { color: #00FF00; background: #001a1a; }img, svg, .q { filter: invert(48%) sepia(79%) saturate(2476%) hue-rotate(150deg) brightness(118%) contrast(119%); }label { color: #00FFFF; display: block; text-transform: uppercase; font-size: 0.75em; letter-spacing: 2px; margin-bottom: 5px; }input { background: #000; color: #00FF00; border: 1px solid #005555; padding: 12px; width: 100%; box-sizing: border-box; font-size: 16px; }input[type='checkbox'] { width: 18px !important; height: 18px !important; accent-color: #00FF00; display: inline-block !important; vertical-align: middle; margin: 10px 5px 10px 0 !important; }input[type='checkbox'] + label { display: inline-block !important; vertical-align: middle; width: auto !important; margin: 0 !important; font-size: 0.7em; letter-spacing: 1px; }button { background: #002222; border: 1px solid #00FFFF; color: #00FF00; padding: 15px; cursor: pointer; text-transform: uppercase; font-weight: bold; display: block; width: 100%; }button:hover { background: #00FFFF; color: #000; }h1, h2 { color: #00FF00; text-transform: uppercase; text-align: center; margin-top: 0; }</style>");
 
-  wm.setSaveConfigCallback([]() {
+  // Optional manual location override — for cases where IP geolocation is
+  // wrong (e.g. Starlink routing traffic through a distant ground station,
+  // making the IP-detected city hundreds of miles from the device's real
+  // location). Left blank, IP-based detection is used as before. Filled in,
+  // this city name is geocoded via Open-Meteo instead. Lives in the same
+  // "wifi-gate" NVS namespace as the WiFi credentials, so it is cleared by
+  // the same Reset WiFi path and never outlives the WiFi setup it belongs to.
+  WiFiManagerParameter cityOverrideParam(
+    "cityOverride", "Override City (optional, e.g. Denver)", "", 40);
+  wm.addParameter(&cityOverrideParam);
+
+  wm.setSaveConfigCallback([&cityOverrideParam]() {
     Preferences p; p.begin("wifi-gate", false);
     p.putString("ssid", WiFi.SSID());
     p.putString("pass", WiFi.psk());
+    String city = String(cityOverrideParam.getValue());
+    city.trim();
+    p.putString("cityOverride", city);
     p.end();
   });
 
@@ -1503,7 +1523,14 @@ bool fetchWeather() {
   HTTPClient http;
   http.setTimeout(5000);
   http.setConnectTimeout(3000);
-  String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + currentCity
+  // currentCity can contain a space (e.g. "New York,US") -- must be
+  // URL-encoded before going into the query string. An unencoded space
+  // here is invalid/ambiguous in a URL and OpenWeatherMap silently fails
+  // the request rather than erroring clearly, which is why this only
+  // surfaced once the city override made multi-word cities common; the
+  // original IP-detected cities rarely had a space right before the comma.
+  String url = "http://api.openweathermap.org/data/2.5/forecast?q="
+               + urlEncodeCityName(currentCity)
                + "&appid=" + String(weatherKey) + "&units=imperial";
   bool success = false;
   if (http.begin(url)) {
@@ -1528,7 +1555,173 @@ bool fetchWeather() {
   return success;
 }
 
+// Minimal percent-encoding for a city name in a query string — just enough
+// for spaces and the handful of punctuation marks a city name might contain
+// (e.g. "Winston-Salem", "St. Louis"). Not a general-purpose URL encoder.
+String urlEncodeCityName(const String &input) {
+  String out;
+  out.reserve(input.length() * 3);
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else if (c == ' ') {
+      out += '+';
+    } else {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+// One geocoding attempt against Open-Meteo for a single query string.
+// Returns true and fills lat/lon/resolvedCity/resolvedCountry on success.
+bool tryGeocodeQuery(HTTPClient &http, WiFiClientSecure &secureClient,
+                      const String &query, float &lat, float &lon,
+                      String &resolvedCity, String &resolvedCountry) {
+  String geoUrl = "https://geocoding-api.open-meteo.com/v1/search?name="
+                   + urlEncodeCityName(query) + "&count=1&language=en&format=json";
+  Serial.print("[LOCATION] Geocoding URL: ");
+  Serial.println(geoUrl);
+
+  bool geocoded = false;
+
+  if (http.begin(secureClient, geoUrl)) {
+    int httpCode = http.GET();
+    Serial.print("[LOCATION] Geocode HTTP response code: ");
+    Serial.println(httpCode);
+
+    if (httpCode == 200) {
+      String body = http.getString();
+      Serial.print("[LOCATION] Geocode response body: ");
+      Serial.println(body);
+
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, body);
+      if (err) {
+        Serial.print("[LOCATION] JSON parse error (geocode): ");
+        Serial.println(err.c_str());
+      } else if (doc["results"].size() > 0) {
+        lat = doc["results"][0]["latitude"];
+        lon = doc["results"][0]["longitude"];
+        resolvedCity = doc["results"][0]["name"].as<String>();
+        resolvedCountry = doc["results"][0]["country_code"].as<String>();
+        geocoded = true;
+        Serial.printf("[LOCATION] Geocoded to: %s, %s (%.4f, %.4f)\n",
+                       resolvedCity.c_str(), resolvedCountry.c_str(), lat, lon);
+      } else {
+        Serial.println("[LOCATION] Geocode succeeded but no results array / empty results");
+      }
+    }
+    http.end();
+  } else {
+    Serial.println("[LOCATION] http.begin() FAILED for geocode URL — TLS/connection setup problem");
+  }
+  return geocoded;
+}
+
+// Geocodes a manually-entered city name via Open-Meteo (free, no API key)
+// and resolves its true UTC offset the same way. Two calls: first turns the
+// city name into coordinates, second asks for the numeric UTC offset at
+// those coordinates (accounts for DST automatically, unlike a fixed IANA
+// name lookup would on this platform). Returns false if the city can't be
+// found or either call fails, so the caller can fall back to IP detection.
+bool syncLocationByCityOverride(const String &cityName) {
+  // HTTPS on this platform needs an explicit WiFiClientSecure — passing a
+  // bare https:// URL string straight to HTTPClient::begin() does not
+  // reliably establish the TLS connection. setInsecure() skips certificate
+  // validation, which is an accepted tradeoff here: this is a read-only
+  // public geocoding lookup with no credentials or sensitive data involved,
+  // not a case where a spoofed/MITM'd response could cause real harm beyond
+  // a wrong city being briefly displayed.
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.setConnectTimeout(3000);
+
+  float lat, lon;
+  String resolvedCity, resolvedCountry;
+
+  // Step 1: city name -> latitude/longitude. Try exactly what was typed
+  // first. Some official city names are hyphenated (Winston-Salem,
+  // Wilkes-Barre) and Open-Meteo's index matches on the literal indexed
+  // name — a space where the real name has a hyphen returns zero results,
+  // even though the city is genuinely in their database. If the as-typed
+  // query comes back empty and it contained a space, retry once with
+  // spaces converted to hyphens before giving up. One extra HTTP call,
+  // only in the failure case.
+  bool geocoded = tryGeocodeQuery(http, secureClient, cityName, lat, lon,
+                                   resolvedCity, resolvedCountry);
+
+  if (!geocoded && cityName.indexOf(' ') >= 0) {
+    String hyphenated = cityName;
+    hyphenated.replace(' ', '-');
+    Serial.println("[LOCATION] Retrying geocode with spaces converted to hyphens");
+    geocoded = tryGeocodeQuery(http, secureClient, hyphenated, lat, lon,
+                                resolvedCity, resolvedCountry);
+  }
+
+  if (!geocoded) return false;
+
+  // Step 2: coordinates -> real UTC offset (handles DST automatically)
+  String tzUrl = "https://api.open-meteo.com/v1/forecast?latitude="
+                  + String(lat, 4) + "&longitude=" + String(lon, 4)
+                  + "&timezone=auto&forecast_days=1";
+  Serial.print("[LOCATION] Timezone URL: ");
+  Serial.println(tzUrl);
+
+  bool resolved = false;
+
+  if (http.begin(secureClient, tzUrl)) {
+    int httpCode = http.GET();
+    Serial.print("[LOCATION] Timezone HTTP response code: ");
+    Serial.println(httpCode);
+
+    if (httpCode == 200) {
+      String body = http.getString();
+      Serial.print("[LOCATION] Timezone response body: ");
+      Serial.println(body);
+
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, body);
+      if (err) {
+        Serial.print("[LOCATION] JSON parse error (timezone): ");
+        Serial.println(err.c_str());
+      } else if (!doc["utc_offset_seconds"].isNull()) {
+        currentUtcOffset = doc["utc_offset_seconds"];
+        currentCity = resolvedCity + "," + resolvedCountry;
+        configTime(currentUtcOffset, 0, "pool.ntp.org", "time.google.com");
+        resolved = true;
+        Serial.printf("[LOCATION] Resolved UTC offset: %ld seconds\n", currentUtcOffset);
+      } else {
+        Serial.println("[LOCATION] Timezone response missing utc_offset_seconds field");
+      }
+    }
+    http.end();
+  } else {
+    Serial.println("[LOCATION] http.begin() FAILED for timezone URL — TLS/connection setup problem");
+  }
+  return resolved;
+}
+
 bool syncLocationAndTime() {
+  // Manual override takes priority when set. Read fresh from NVS each call
+  // (rather than caching in RAM) since it can only change via a full WiFi
+  // reset anyway, and this keeps a single source of truth in one place.
+  prefs.begin("wifi-gate", true);
+  String cityOverride = prefs.getString("cityOverride", "");
+  prefs.end();
+
+  if (cityOverride != "") {
+    if (syncLocationByCityOverride(cityOverride)) return true;
+    Serial.println("[LOCATION] City override lookup failed, falling back to IP detection");
+    // fall through to IP-based detection below
+  }
+
   HTTPClient http;
   http.setTimeout(5000);
   http.setConnectTimeout(3000);
